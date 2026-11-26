@@ -8,6 +8,14 @@ Project Nexus is a Windows desktop app for image and object tracking in local vi
 - `nexus_app.py` and the packaged Windows executable provide drag-and-drop loading and MP4 export for whole-frame dither. The separate Project Nexus Tracking executable uses the shared CSRT core. It opens a video, accepts one on-screen box, exports a tracking-box or tracked-dither MP4 with CSV, and plays the result in the desktop window. Both modes passed the synthetic translation test. Real-footage and laptop performance verification remain pending.
 - The release order below reflects current project priorities. TASKS.md and HANDOFF.md hold ownership and handoff records. Their initial implementation status predates the CLI and desktop build.
 
+### Soft Dots build
+
+`Project Nexus Soft Dots.exe` opens with **Soft Dots**, a full-frame halftone based on the supplied clip and screenshot settings. It uses a stable grid of source-colored, brightness-sized circles over a blurred image. At 2560 × 1440 the supplied export measured 13.21 px horizontally and 21.96 px vertically. The Nexus preset measured 13.19 px and 22.02 px on a clean swatch at that size.
+
+The **Dots settings** window groups dot size, blend, opacity, coverage and grid, backdrop mode and softness, tone and final blur, and color and tint. **Reset to reference** restores the visible settings from the screenshots. **Presets & export** can save variations. The demo and reusable preset are in `.nexus-runtime/dots-demo`.
+
+The effect applies directly to any supported clip and produces a silent MP4. **Dots only** composites over black for MP4. The pre-effect version of the supplied video was unavailable, so the measured grid and visible settings were matched independently. The reference is an output from [ASCII Magic’s Dots style](https://www.ascii-magic.com/docs/styles).
+
 ### Timeline and Inspector build
 
 - **Advanced → Tracking & motion** controls automatic tracking response, animation speed, and the box range. The minimum is a search target based on available picture detail. The maximum is a firm cap. Setting animation speed to zero freezes the time-driven graphics while tracking continues. **Layers** holds scene switches and styling. **Presets & export** holds saved looks and output sizes.

@@ -1,6 +1,6 @@
 """Configurable looks and planar tracking for Nexus."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import re
@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from dither import BAYER
+from dots_effect import DOTS, DotsSettings
 from scene_effects import ARCHIVE, CCTV, POETIC, SCENE_MODES, THERMAL, WEB
 
 
@@ -20,7 +21,8 @@ DITHER = "Ordered dither"
 MOSAIC = "Pixel mosaic"
 SIGNAL = "Signal grid"
 ARTWORK = "Image overlay"
-MODES = (*SCENE_MODES, OUTLINE, DITHER, MOSAIC, SIGNAL, ARTWORK)
+FULL_FRAME_MODES = (DOTS, *SCENE_MODES)
+MODES = (*FULL_FRAME_MODES, OUTLINE, DITHER, MOSAIC, SIGNAL, ARTWORK)
 QUALITY = {"Full size": 1.0, "Compact · 75%": .75, "Small · 50%": .5}
 
 
@@ -40,6 +42,7 @@ class Look:
     labels: bool = True
     trails: bool = True
     crops: bool = True
+    dots: DotsSettings = field(default_factory=DotsSettings)
 
     def validate(self):
         if self.mode not in MODES or self.quality not in QUALITY:
@@ -62,6 +65,9 @@ class Look:
             raise ValueError("Minimum boxes must be less than or equal to maximum boxes.")
         if any(type(getattr(self, field)) is not bool for field in ("links", "labels", "trails", "crops")):
             raise ValueError("Layer switches must be on or off.")
+        if not isinstance(self.dots, DotsSettings):
+            raise ValueError("Invalid soft dots settings.")
+        self.dots.validate()
         return self
 
 
@@ -72,7 +78,10 @@ SCENE_LOOKS = {
     THERMAL: Look(THERMAL, 100, 12, "#A0F5FF", max_boxes=33),
     POETIC: Look(POETIC, 100, 9, "#EEF8D9", max_boxes=27),
 }
+DOTS_LOOK = Look(DOTS)
+FULL_FRAME_LOOKS = {DOTS: DOTS_LOOK, **SCENE_LOOKS}
 PRESETS = {
+    "Soft Dots · Reference": DOTS_LOOK,
     **SCENE_LOOKS,
     "Tracking guide": Look(),
     "Mint halftone": Look(DITHER, 92, 4, "#8AFFCA"),
@@ -88,6 +97,10 @@ def load_preset(path):
         raise ValueError("This is not a supported Nexus preset.")
     try:
         fields = dict(data["look"])
+        if "dots" in fields:
+            if not isinstance(fields["dots"], dict):
+                raise ValueError("Invalid soft dots settings.")
+            fields["dots"] = DotsSettings(**fields["dots"])
         if fields.get("mode") in SCENE_MODES and "max_boxes" not in fields:
             detail = fields.get("detail", Look().detail)
             if type(detail) is int and 2 <= detail <= 24:

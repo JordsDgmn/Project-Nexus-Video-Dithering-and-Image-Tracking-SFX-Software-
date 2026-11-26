@@ -1,5 +1,6 @@
 """Render a subject or surface track and its per-frame positions."""
 
+from contextlib import nullcontext
 import csv
 import math
 from pathlib import Path
@@ -8,6 +9,7 @@ import tempfile
 import cv2
 import numpy as np
 
+from dots_effect import DOTS, DotsRenderer
 from scene_effects import SCENE_MODES, SceneTracker, paint_scene
 from studio_effects import Effect, QUALITY, box_corners, surface_frames
 from track import tracked_frames
@@ -17,23 +19,26 @@ class Cancelled(Exception):
     pass
 
 
-def scene_frames(capture, tracker):
+def decoded_frames(capture, tracker):
     while True:
         ok, frame = capture.read()
         if not ok:
             break
-        yield frame, tracker.update(frame)
+        yield frame, tracker.update(frame) if tracker is not None else None
 
 
 def export_track(source, selection, destination, look, planar, cancel, progress, finalizing=None):
     positions = destination.with_suffix(".csv")
     if destination.suffix.lower() != ".mp4":
         raise ValueError("Save the output as an MP4 file.")
-    if any(path.exists() or path.is_symlink() for path in (destination, positions)):
-        raise ValueError("The MP4 or CSV already exists. Choose another filename.")
+    is_dots = look.mode == DOTS
+    targets = (destination,) if is_dots else (destination, positions)
+    if any(path.exists() or path.is_symlink() for path in targets):
+        raise ValueError("An output already exists. Choose another filename.")
     look.validate()
     automatic = look.mode in SCENE_MODES
-    effect = None if automatic else Effect(look)
+    effect = None if automatic or is_dots else Effect(look)
+    dots = DotsRenderer(look.dots) if is_dots else None
     scene = SceneTracker(look.detail, look) if automatic else None
 
     capture = cv2.VideoCapture(str(source))
@@ -55,8 +60,8 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
         pad = padded_size != render_size
         lost = set()
         count = 0
-        if automatic:
-            tracks = scene_frames(capture, scene)
+        if automatic or is_dots:
+            tracks = decoded_frames(capture, scene)
         else:
             tracks = surface_frames(capture, selection) if planar else tracked_frames(
                 capture, selection, max_tracking_edge=960
@@ -69,13 +74,14 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
             try:
                 if not writer.isOpened():
                     raise ValueError("Could not open the MP4 encoder.")
-                with data.open("w", encoding="utf-8", newline="") as stream:
-                    rows = csv.writer(stream)
+                csv_file = nullcontext() if is_dots else data.open("w", encoding="utf-8", newline="")
+                with csv_file as stream:
+                    rows = csv.writer(stream) if stream is not None else None
                     header = ("frame", "status", "x", "y", "width", "height")
                     corners = ("tl_x", "tl_y", "tr_x", "tr_y", "br_x", "br_y", "bl_x", "bl_y")
                     if automatic:
                         rows.writerow(("frame", "status", "id", "center_x", "center_y", "radius"))
-                    else:
+                    elif rows is not None:
                         rows.writerow(header + corners if planar else header)
                     for index, (frame, region) in enumerate(tracks):
                         if cancel.is_set():
@@ -92,6 +98,8 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                             else:
                                 lost.add(index)
                                 rows.writerow((index, "lost", "", "", "", ""))
+                        elif rows is None:
+                            pass
                         elif region is None:
                             lost.add(index)
                             rows.writerow((index, "lost", *([""] * (12 if planar else 4))))
@@ -111,6 +119,8 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                                 region = [(identity, center * factors, radius * scale, trail * factors)
                                           for identity, center, radius, trail in region]
                             frame = paint_scene(frame, region, look, index, fps, scene.crop_ids)
+                        elif is_dots:
+                            frame = dots.frame(frame)
                         else:
                             effect.apply(frame, quad, planar)
                         if pad:
@@ -134,6 +144,9 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                 check.release()
             if cancel.is_set():
                 raise Cancelled
+            if is_dots:
+                preview.rename(destination)
+                return count, lost
             positions = data.rename(positions)
             try:
                 preview.rename(destination)

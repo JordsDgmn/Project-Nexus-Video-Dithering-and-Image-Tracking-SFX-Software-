@@ -9,6 +9,7 @@ from threading import Condition, Thread
 import cv2
 import numpy as np
 
+from dots_effect import DOTS, DotsRenderer
 from scene_effects import SCENE_MODES, SceneTracker, paint_scene
 from studio_effects import Effect, box_corners, surface_frames
 from track import tracked_frames
@@ -93,7 +94,9 @@ class Stream:
         self.last = None
         self.fps = self.capture.get(cv2.CAP_PROP_FPS) or 30
         self.auto = spec.look is not None and spec.look.mode in SCENE_MODES
-        self.manual = spec.look is not None and not self.auto and spec.selection is not None
+        self.dots = DotsRenderer(spec.look.dots) if spec.look is not None and spec.look.mode == DOTS else None
+        self.manual = (spec.look is not None and self.dots is None
+                       and not self.auto and spec.selection is not None)
         self.tracker = self.iterator = self.effect = None
 
     def close(self):
@@ -146,6 +149,8 @@ class Stream:
                     tracks = self.tracker.update(frame)
                     frame = paint_scene(frame, tracks, self.spec.look, self.index + 1,
                                         self.fps, self.tracker.crop_ids)
+                elif self.dots is not None:
+                    frame = self.dots.frame(frame)
             self.index += 1
             self.last = frame
             if self.manual and self.index < target and self.index % 12 == 0:
