@@ -9,7 +9,7 @@ import tempfile
 import cv2
 
 
-def tracked_frames(capture, box):
+def tracked_frames(capture, box, max_tracking_edge=None):
     """Yield each decoded frame and its tracked box, or None on tracking loss."""
     ok, frame = capture.read()
     if not ok:
@@ -24,8 +24,23 @@ def tracked_frames(capture, box):
             f"The starting box must fit inside the {frame_width}x{frame_height} first frame."
         )
 
+    scale = 1.
+    if max_tracking_edge is not None:
+        # Avoid shrinking a small target below a useful size.
+        scale = min(1., max(max_tracking_edge / max(frame_width, frame_height),
+                           40 / min(width, height)))
+    data_size = (round(frame_width * scale), round(frame_height * scale))
+    ratio_x, ratio_y = data_size[0] / frame_width, data_size[1] / frame_height
     tracker = cv2.TrackerCSRT_create()
-    if tracker.init(frame, tuple(box)) is False:
+    initial = tuple(box)
+    if scale < 1:
+        left, top = round(x * ratio_x), round(y * ratio_y)
+        initial = (left, top, max(1, round((x + width) * ratio_x) - left),
+                   max(1, round((y + height) * ratio_y) - top))
+        tracking_frame = cv2.resize(frame, data_size, interpolation=cv2.INTER_AREA)
+    else:
+        tracking_frame = frame
+    if tracker.init(tracking_frame, initial) is False:
         raise ValueError("Could not initialize the tracker with the starting box.")
     yield frame, tuple(box)
 
@@ -33,7 +48,13 @@ def tracked_frames(capture, box):
         ok, frame = capture.read()
         if not ok:
             break
-        found, region = tracker.update(frame)
+        tracking_frame = cv2.resize(frame, data_size, interpolation=cv2.INTER_AREA) if scale < 1 else frame
+        found, region = tracker.update(tracking_frame)
+        if found and scale < 1:
+            left, top, region_width, region_height = region
+            x0, y0 = round(left / ratio_x), round(top / ratio_y)
+            region = (x0, y0, round((left + region_width) / ratio_x) - x0,
+                      round((top + region_height) / ratio_y) - y0)
         yield frame, region if found else None
 
 
