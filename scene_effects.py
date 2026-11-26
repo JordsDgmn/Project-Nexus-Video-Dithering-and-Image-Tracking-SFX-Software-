@@ -45,14 +45,18 @@ class Point:
 
 
 class SceneTracker:
-    def __init__(self, density):
+    def __init__(self, density, look=None):
         self.points = []
         self.previous = None
         self.crop_ids = [None, None]
         self.next_id = 1
         self.count = 0
-        self.limit = 9 + density * 2
-        self.spacing = max(12, 38 - density)
+        self.limit = look.max_boxes if look is not None else 9 + density * 2
+        self.minimum = look.min_boxes if look is not None else min(12, self.limit)
+        response = look.tracking_speed if look is not None else 65
+        self.alpha = .20 + .80 * response / 100
+        self.reseed_interval = max(2, round(12 - response / 10))
+        self.spacing = max(7, min(38 - density, round(105 / self.limit ** .5)))
 
     def update(self, frame):
         height, width = frame.shape[:2]
@@ -73,12 +77,13 @@ class SceneTracker:
                             self.points, moved[:, 0], (error < 1.65) & good.ravel() & status.ravel()):
                         if valid and 3 <= target[0] < size[0] - 3 and 3 <= target[1] < size[1] - 3:
                             point.position = target
-                            point.smooth = .72 * target + .28 * point.smooth
+                            point.smooth = self.alpha * target + (1 - self.alpha) * point.smooth
                             point.trail.append(point.smooth.copy())
                             survivor.append(point)
             self.points = survivor
 
-        if self.count == 0 or not self.points or (self.count % 5 == 0 and len(self.points) < self.limit):
+        if (len(self.points) < self.minimum or not self.points
+                or (self.count % self.reseed_interval == 0 and len(self.points) < self.limit)):
             mask = np.full(gray.shape, 255, dtype=np.uint8)
             border = min(14, max(3, min(size) // 12))
             mask[:border] = mask[-border:] = 0
@@ -89,18 +94,34 @@ class SceneTracker:
                 gray, maxCorners=self.limit - len(self.points), qualityLevel=.012,
                 minDistance=self.spacing, mask=mask,
             )
-            if corners is not None:
-                for pos in corners[:, 0]:
-                    radius = 9 + (self.next_id * 13) % 23
-                    self.points.append(Point(self.next_id, pos.copy(), pos.copy(),
-                                             radius, deque([pos.copy()], maxlen=12)))
-                    self.next_id += 1
+            self.add_points(corners)
+            if len(self.points) < self.minimum:
+                spacing = max(4, self.spacing // 2)
+                mask.fill(255)
+                mask[:border] = mask[-border:] = 0
+                mask[:, :border] = mask[:, -border:] = 0
+                for point in self.points:
+                    cv2.circle(mask, tuple(np.rint(point.position).astype(int)), spacing, 0, -1)
+                self.add_points(cv2.goodFeaturesToTrack(
+                    gray, maxCorners=self.minimum - len(self.points), qualityLevel=.004,
+                    minDistance=spacing, mask=mask,
+                ))
 
         self.count += 1
         self.previous = gray
         inverse = np.float32((width / size[0], height / size[1]))
         return [(point.id, point.smooth * inverse, point.size * float(inverse.mean()),
                  np.array(point.trail) * inverse) for point in self.points]
+
+
+    def add_points(self, points):
+        if points is None:
+            return
+        for position in points[:, 0]:
+            radius = 9 + (self.next_id * 13) % 23
+            self.points.append(Point(self.next_id, position.copy(), position.copy(),
+                                     radius, deque([position.copy()], maxlen=12)))
+            self.next_id += 1
 
 
 def grade(frame, mode, tick):
@@ -205,9 +226,10 @@ def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
     mode = look.mode
     tint = tuple(bytes.fromhex(look.tint[1:])[::-1])
     pale = tuple(int(v * .30 + 178) for v in tint)
-    image = grade(frame, mode, index)
-
-    for left, right in linked_pairs(tracks, mode, (width, height)):
+    tick = index * look.animation_speed / 100
+    image = grade(frame, mode, int(tick))
+    pairs = linked_pairs(tracks, mode, (width, height)) if look.links else ()
+    for left, right in pairs:
         off = tracks[left][1]
         end = tracks[right][1]
         if mode == CCTV:
@@ -224,12 +246,17 @@ def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
         if mode == ARCHIVE:
             delta = end - off
             length = max(1, round(np.linalg.norm(delta)))
-            for step in range(0, length, 13 * unit):
+            offset = int(tick * 1.6) % (13 * unit)
+            for step in range(offset, length, 13 * unit):
                 a = np.rint(off + delta * (step / length)).astype(int)
                 b = np.rint(off + delta * (min(length, step + 5 * unit) / length)).astype(int)
                 cv2.line(image, tuple(a), tuple(b), pale, unit, cv2.LINE_AA)
         else:
             cv2.polylines(image, [np.rint(line).astype(np.int32)], False, tone, unit, cv2.LINE_AA)
+            if mode in (WEB, CCTV) and tracks[left][0] % 4 == 0:
+                phase = ((tick * .038) + tracks[left][0] * .17) % 1
+                point = np.rint(off * (1 - phase) + end * phase).astype(int)
+                cv2.circle(image, tuple(point), 2 * unit, tint, -1, cv2.LINE_AA)
 
     for identity, position, radius, trail in tracks:
         x, y = np.rint(position).astype(int)
@@ -237,7 +264,7 @@ def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
         ratio = 0.65 + ((identity * 7) % 6) * .16
         span = max(4, round(size * ratio))
         x1, y1, x2, y2 = x-size, y-span, x+size, y+span
-        if mode == WEB and len(trail) > 2:
+        if look.trails and mode == WEB and len(trail) > 2:
             cv2.polylines(image, [np.rint(trail).astype(np.int32)], False, tint, unit, cv2.LINE_AA)
         if mode in (WEB, CCTV) and identity % 3 != 0:
             arm = max(3, size // 3)
@@ -256,13 +283,14 @@ def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
             text = f"OBJECT {identity:03d}"
         else:
             text = f"{identity:03d}/{x:04d}.{y:04d}"
-        if mode != WEB or identity % 2 == 0:
+        if look.labels and (mode != WEB or identity % 2 == 0):
             label(image, text, (x1, y1 - 5), tint, font, chip=mode in (CCTV, ARCHIVE),
                   italic=mode == POETIC)
 
     if mode == CCTV:
-        crop_windows(image, frame, tracks, tint, font, unit,
-                     crop_ids if crop_ids is not None else [None, None])
+        if look.crops:
+            crop_windows(image, frame, tracks, tint, font, unit,
+                         crop_ids if crop_ids is not None else [None, None])
         margin = max(6, round(min(height, width) * .026))
         cv2.rectangle(image, (margin, margin), (width-margin-1, height-margin-1),
                       pale, unit, cv2.LINE_AA)

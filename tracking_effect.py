@@ -25,7 +25,7 @@ def scene_frames(capture, tracker):
         yield frame, tracker.update(frame)
 
 
-def export_track(source, selection, destination, look, planar, cancel, progress):
+def export_track(source, selection, destination, look, planar, cancel, progress, finalizing=None):
     positions = destination.with_suffix(".csv")
     if destination.suffix.lower() != ".mp4":
         raise ValueError("Save the output as an MP4 file.")
@@ -34,7 +34,7 @@ def export_track(source, selection, destination, look, planar, cancel, progress)
     look.validate()
     automatic = look.mode in SCENE_MODES
     effect = None if automatic else Effect(look)
-    scene = SceneTracker(look.detail) if automatic else None
+    scene = SceneTracker(look.detail, look) if automatic else None
 
     capture = cv2.VideoCapture(str(source))
     try:
@@ -123,6 +123,9 @@ def export_track(source, selection, destination, look, planar, cancel, progress)
             finally:
                 writer.release()
 
+            progress(count, total)
+            if finalizing is not None:
+                finalizing()
             check = cv2.VideoCapture(str(preview))
             try:
                 if not check.read()[0] or round(check.get(cv2.CAP_PROP_FRAME_COUNT)) != count:

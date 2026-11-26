@@ -32,6 +32,14 @@ class Look:
     tint: str = "#78EDBE"
     quality: str = "Full size"
     artwork: str = ""
+    tracking_speed: int = 65
+    animation_speed: int = 100
+    min_boxes: int = 12
+    max_boxes: int = 40
+    links: bool = True
+    labels: bool = True
+    trails: bool = True
+    crops: bool = True
 
     def validate(self):
         if self.mode not in MODES or self.quality not in QUALITY:
@@ -44,15 +52,25 @@ class Look:
             raise ValueError("Choose a six-digit tint color.")
         if not isinstance(self.artwork, str):
             raise ValueError("Invalid overlay image path.")
+        for key, low, high in (
+                ("tracking_speed", 0, 100), ("animation_speed", 0, 250),
+                ("min_boxes", 0, 100), ("max_boxes", 1, 100)):
+            value = getattr(self, key)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{key.replace('_', ' ').capitalize()} must be {low} to {high}.")
+        if self.min_boxes > self.max_boxes:
+            raise ValueError("Minimum boxes must be less than or equal to maximum boxes.")
+        if any(type(getattr(self, field)) is not bool for field in ("links", "labels", "trails", "crops")):
+            raise ValueError("Layer switches must be on or off.")
         return self
 
 
 SCENE_LOOKS = {
-    CCTV: Look(CCTV, 100, 9, "#B8CFED"),
-    WEB: Look(WEB, 100, 20, "#66E8EF"),
-    ARCHIVE: Look(ARCHIVE, 100, 13, "#FFF3C9"),
-    THERMAL: Look(THERMAL, 100, 12, "#A0F5FF"),
-    POETIC: Look(POETIC, 100, 9, "#EEF8D9"),
+    CCTV: Look(CCTV, 100, 9, "#B8CFED", max_boxes=27),
+    WEB: Look(WEB, 100, 20, "#66E8EF", max_boxes=49),
+    ARCHIVE: Look(ARCHIVE, 100, 13, "#FFF3C9", max_boxes=35),
+    THERMAL: Look(THERMAL, 100, 12, "#A0F5FF", max_boxes=33),
+    POETIC: Look(POETIC, 100, 9, "#EEF8D9", max_boxes=27),
 }
 PRESETS = {
     **SCENE_LOOKS,
@@ -69,7 +87,12 @@ def load_preset(path):
     if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("look"), dict):
         raise ValueError("This is not a supported Nexus preset.")
     try:
-        look = Look(**data["look"]).validate()
+        fields = dict(data["look"])
+        if fields.get("mode") in SCENE_MODES and "max_boxes" not in fields:
+            detail = fields.get("detail", Look().detail)
+            if type(detail) is int and 2 <= detail <= 24:
+                fields["max_boxes"] = 9 + detail * 2
+        look = Look(**fields).validate()
     except TypeError as error:
         raise ValueError("Preset contains unknown settings.") from error
     return look

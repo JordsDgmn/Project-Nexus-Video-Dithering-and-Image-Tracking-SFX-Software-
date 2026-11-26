@@ -8,6 +8,12 @@ Project Nexus is a Windows desktop app for image and object tracking in local vi
 - `nexus_app.py` and the packaged Windows executable provide drag-and-drop loading and MP4 export for whole-frame dither. The separate Project Nexus Tracking executable uses the shared CSRT core. It opens a video, accepts one on-screen box, exports a tracking-box or tracked-dither MP4 with CSV, and plays the result in the desktop window. Both modes passed the synthetic translation test. Real-footage and laptop performance verification remain pending.
 - The release order below reflects current project priorities. TASKS.md and HANDOFF.md hold ownership and handoff records. Their initial implementation status predates the CLI and desktop build.
 
+### Timeline and Inspector build
+
+- **Advanced → Tracking & motion** controls automatic tracking response, animation speed, and the box range. The minimum is a search target based on available picture detail. The maximum is a firm cap. Setting animation speed to zero freezes the time-driven graphics while tracking continues. **Layers** holds scene switches and styling. **Presets & export** holds saved looks and output sizes.
+- The main timeline previews the selected frame before export. **Original** compares it with the source at the same point. **First frame** returns to the start for manual target selection. Automatic seeks initialize tracking near the selected frame for speed, so exact IDs can differ from the sequential export. Manual tracking may need to process intervening frames, and the app shows buffering progress.
+- **Inspector** shows video metadata, Windows hardware, and live resource samples. GPU engine load appears when Windows exposes the relevant counters. Render throughput and ETA come from processed frames and appeared in testing. Exports retain the existing silent MP4 and CSV formats.
+
 ### Auto Looks build
 
 The Windows executable is `.nexus-runtime/release/Project Nexus Auto Looks.exe`. Drop a clip, choose a look, preview the first four seconds, and export. Advanced opens output size, opacity, detail, tint, presets, and the existing subject and surface tools.
