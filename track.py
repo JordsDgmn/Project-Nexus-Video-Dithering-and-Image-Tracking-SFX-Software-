@@ -9,6 +9,34 @@ import tempfile
 import cv2
 
 
+def tracked_frames(capture, box):
+    """Yield each decoded frame and its tracked box, or None on tracking loss."""
+    ok, frame = capture.read()
+    if not ok:
+        raise ValueError("Could not decode the first video frame.")
+    x, y, width, height = box
+    frame_height, frame_width = frame.shape[:2]
+    if (
+        x < 0 or y < 0 or width <= 0 or height <= 0
+        or x + width > frame_width or y + height > frame_height
+    ):
+        raise ValueError(
+            f"The starting box must fit inside the {frame_width}x{frame_height} first frame."
+        )
+
+    tracker = cv2.TrackerCSRT_create()
+    if tracker.init(frame, tuple(box)) is False:
+        raise ValueError("Could not initialize the tracker with the starting box.")
+    yield frame, tuple(box)
+
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        found, region = tracker.update(frame)
+        yield frame, region if found else None
+
+
 def track(video, box, output):
     if not video.is_file():
         raise ValueError(f"Video file does not exist: {video}")
@@ -20,23 +48,8 @@ def track(video, box, output):
     capture = cv2.VideoCapture(str(video))
     temporary = None
     try:
-        ok, frame = capture.read()
-        if not ok:
-            raise ValueError(f"Could not decode the first frame: {video}")
-        x, y, width, height = box
-        frame_height, frame_width = frame.shape[:2]
-        if (
-            x < 0 or y < 0 or width <= 0 or height <= 0
-            or x + width > frame_width or y + height > frame_height
-        ):
-            raise ValueError(
-                f"The starting box must fit inside the {frame_width}x{frame_height} first frame."
-            )
-
-        tracker = cv2.TrackerCSRT_create()
-        if tracker.init(frame, tuple(box)) is False:
-            raise ValueError("Could not initialize the tracker with the starting box.")
-
+        frames = tracked_frames(capture, box)
+        first = next(frames)
         with tempfile.NamedTemporaryFile(
             mode="w", newline="", encoding="utf-8",
             dir=output.parent, prefix=".nexus-", suffix=".tmp", delete=False,
@@ -44,19 +57,15 @@ def track(video, box, output):
             temporary = Path(stream.name)
             writer = csv.writer(stream)
             writer.writerow(("frame", "status", "x", "y", "width", "height"))
-            writer.writerow((0, "tracked", *box))
+            writer.writerow((0, "tracked", *first[1]))
             count = 1
             lost = 0
-            while True:
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                found, region = tracker.update(frame)
-                if found:
-                    writer.writerow((count, "tracked", *region))
-                else:
+            for _, region in frames:
+                if region is None:
                     writer.writerow((count, "lost", "", "", "", ""))
                     lost += 1
+                else:
+                    writer.writerow((count, "tracked", *region))
                 count += 1
 
         os.replace(temporary, output)
