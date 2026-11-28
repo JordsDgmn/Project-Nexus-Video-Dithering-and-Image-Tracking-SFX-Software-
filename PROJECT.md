@@ -10,9 +10,11 @@ Project Nexus is a Windows desktop app for image and object tracking in local vi
 
 ### Live Studio build
 
-Open `.nexus-runtime/release/Project Nexus Live Studio.exe` and use **Save preset…** or **Load preset…** below the preview. The preset folder starts with **softdots-bright-halftone**, using all four Soft Dots tabs from the supplied screenshots. Presets store the look, style settings, tracking mode, output size, and preview quality. The source video, timeline position, and per-clip tracking selection are picked for each job. Image overlay presets reference the image file.
+Open `.nexus-runtime/release/Project Nexus Live Studio v2.exe` and use **Save preset…** or **Load preset…** below the preview. The preset folder starts with **softdots-bright-halftone**, using all four Soft Dots tabs from the supplied screenshots. Presets store the look, style settings, tracking mode, output size, and preview quality. The source video, timeline position, and per-clip tracking selection are picked for each job. Image overlay presets reference the image file.
 
 Nexus offers to save changes before replacing an edited style. **Cancel** keeps the current look and settings. Soft Dots and tracking controls refresh the current frame and also work during **Play preview**. **Preview quality** offers Auto, Performance, Balanced, and High. Auto adapts the working resolution during playback. The size under **Advanced → Presets & export** controls the exported video separately.
+
+Live Studio v2 exports 8-bit H.264 MP4 with a bundled offline FFmpeg encoder. It verifies the dimensions, rate, frame count, and first and last frames before publishing. The export summary reports tracking gaps separately from the number of video frames. [DaVinci Resolve 20 codec support](https://documents.blackmagicdesign.com/SupportNotes/DaVinci_Resolve_20_Supported_Codec_List.pdf)
 
 ### Tracking Lab build
 

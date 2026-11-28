@@ -9,6 +9,8 @@ import tempfile
 import cv2
 import numpy as np
 
+from nexus_video import H264Writer, verify_h264
+
 
 BAYER = np.array(
     [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
@@ -45,14 +47,9 @@ def apply_filter(source, destination):
         ) as stream:
             temporary = Path(stream.name)
 
-        writer = cv2.VideoWriter(
-            str(temporary), cv2.VideoWriter_fourcc(*"mp4v"),
-            fps, (padded_width, padded_height),
-        )
+        size = padded_width, padded_height
         count = 0
-        try:
-            if not writer.isOpened():
-                raise ValueError("Could not initialize the MP4 encoder.")
+        with H264Writer(temporary, fps, size) as writer:
             while ok:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 dithered = (gray > threshold).astype(np.uint8) * 255
@@ -63,15 +60,9 @@ def apply_filter(source, destination):
                 writer.write(cv2.cvtColor(dithered, cv2.COLOR_GRAY2BGR))
                 count += 1
                 ok, frame = capture.read()
-        finally:
-            writer.release()
+            writer.finish()
 
-        check = cv2.VideoCapture(str(temporary))
-        try:
-            if not check.read()[0] or round(check.get(cv2.CAP_PROP_FRAME_COUNT)) != count:
-                raise ValueError("Could not verify the exported video.")
-        finally:
-            check.release()
+        verify_h264(temporary, count, size, fps)
         # On Windows rename fails if another file now occupies the destination.
         os.rename(temporary, destination)
         return count

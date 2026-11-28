@@ -43,7 +43,7 @@ ACCENT = "#78edbe"
 class TrackingApp(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Project Nexus — Live Studio")
+        self.title("Project Nexus — Live Studio v2")
         self.geometry("1100x780")
         self.minsize(920, 650)
         self.configure(bg=BG)
@@ -910,7 +910,9 @@ class TrackingApp(TkinterDnD.Tk):
         duration = clock(self.render_stats.get("elapsed"))
         if not writes_tracking_data(self.last_render_look):
             return f"Saved {self.result.name} in {duration} · {self.count:,} frames."
-        return f"Saved {self.result.name} and CSV in {duration}. {len(self.lost):,} of {self.count:,} frames lost."
+        missing = len(self.lost)
+        note = (f" No targets tracked on {missing:,} frames ({missing / self.count:.1%})." if missing else "")
+        return f"Saved {self.result.name} and CSV in {duration} · {self.count:,} video frames." + note
 
     def request_cancel(self):
         self.cancel.set()
@@ -1107,7 +1109,7 @@ class TrackingApp(TkinterDnD.Tk):
         if self.preview_channel == "source" and self.target.get() != AUTO and self.box is None:
             label = "Source preview · use First frame to select a target"
         position = f"frame {frame + 1:,}" + (f" / {total:,}" if total else "")
-        self.status.set(f"{label}  ·  {position}" + ("  ·  Track lost" if track_lost else ""))
+        self.status.set(f"{label}  ·  {position}" + ("  ·  No target tracked" if track_lost else ""))
         if self.preview_playing:
             now = time.monotonic()
             if self.last_presented is not None:

@@ -11,6 +11,7 @@ import numpy as np
 
 from dots_effect import DOTS, DotsRenderer
 from graphics_settings import needs_scene_tracks
+from nexus_video import H264Writer, verify_h264
 from scene_effects import SCENE_MODES, SceneTracker, paint_scene, transform_track
 from studio_effects import Effect, QUALITY, box_corners, surface_frames
 from track import tracked_frames
@@ -76,10 +77,7 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
         with tempfile.TemporaryDirectory(prefix=".nexus-", dir=destination.parent) as stage:
             preview = Path(stage) / "preview.mp4"
             data = Path(stage) / "positions.csv"
-            writer = cv2.VideoWriter(str(preview), cv2.VideoWriter_fourcc(*"mp4v"), fps, padded_size)
-            try:
-                if not writer.isOpened():
-                    raise ValueError("Could not open the MP4 encoder.")
+            with H264Writer(preview, fps, padded_size) as writer:
                 csv_file = data.open("w", encoding="utf-8", newline="") if has_data else nullcontext()
                 with csv_file as stream:
                     rows = csv.writer(stream) if stream is not None else None
@@ -137,18 +135,13 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                         count = index + 1
                         if count == 1 or count % 5 == 0:
                             progress(count, total)
-            finally:
-                writer.release()
+                progress(count, total)
+                if finalizing is not None:
+                    finalizing()
+                if not writer.finish(cancel):
+                    raise Cancelled
 
-            progress(count, total)
-            if finalizing is not None:
-                finalizing()
-            check = cv2.VideoCapture(str(preview))
-            try:
-                if not check.read()[0] or round(check.get(cv2.CAP_PROP_FRAME_COUNT)) != count:
-                    raise ValueError("The exported preview could not be verified.")
-            finally:
-                check.release()
+            verify_h264(preview, count, padded_size, fps)
             if cancel.is_set():
                 raise Cancelled
             if not has_data:
