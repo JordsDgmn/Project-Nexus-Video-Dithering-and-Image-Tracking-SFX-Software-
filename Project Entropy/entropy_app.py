@@ -22,11 +22,11 @@ import cv2
 
 from entropy_diagnostics import DiagnosticsWindow, SessionLog, project_directory
 from entropy_engine import (
-    BLENDS, CUSTOM, LOOP_FITS, MAX_EXPORT_SECONDS, MODES, PALETTES, POOL, PRESETS,
+    BLENDS, BOKEH, CUSTOM, LOOP_FITS, MAX_EXPORT_SECONDS, MODES, PALETTES, POOL, PRESETS,
     RATIOS, ROTATION_DIRECTIONS, ExportSpec, Look, capped, clip_timing, decode_look, validate_colors,
 )
 from entropy_library import Library
-from entropy_studio import PalettesWindow, PresetsWindow, TexturesWindow
+from entropy_studio import BokehWindow, PalettesWindow, PresetsWindow, StyleWindow, TexturesWindow
 from entropy_runtime import Cancelled, PreviewWorker, estimate, export_clip, load_preset, save_preset, seconds_label
 
 
@@ -165,7 +165,7 @@ class EntropyApp(tk.Tk):
         self.look, self.export = look, spec
         self.fields = {
             name: self.variable(value, editable=name == "seed")
-            for name, value in asdict(look).items() if name not in ("textures", "colors")
+            for name, value in asdict(look).items() if name not in ("textures", "colors", "style", "bokeh")
         }
         self.output = {
             name: tk.StringVar(value=duration_field(value)) if name == "seconds" else self.variable(value)
@@ -244,7 +244,7 @@ class EntropyApp(tk.Tk):
         self.save_preset_button = ttk.Button(header, text="Save preset…", command=self.save_named_preset)
         self.save_preset_button.pack(side="right", padx=(0, 7))
         for label, tool in (("Presets", PresetsWindow), ("Palettes", PalettesWindow),
-                            ("Textures", TexturesWindow)):
+                            ("Textures", TexturesWindow), ("Style", StyleWindow)):
             ttk.Button(header, text=label, command=lambda cls=tool: self.open_tool(cls)).pack(
                 side="right", padx=(0, 7))
 
@@ -298,6 +298,9 @@ class EntropyApp(tk.Tk):
         self.reset_effect_button = ttk.Button(effect_header, text="Effect defaults",
                                               command=self.reset_effect_controls)
         self.reset_effect_button.pack(side="right")
+        self.bokeh_button = ttk.Button(effect_header, text="Bokeh camera…",
+                                       command=lambda: self.open_tool(BokehWindow))
+        self.update_bokeh_button()
         switches = tk.Frame(side, bg=PANEL)
         switches.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         for i, mode in enumerate(MODES):
@@ -446,14 +449,16 @@ class EntropyApp(tk.Tk):
     def reset_effect_controls(self):
         self.capture_settings()
         defaults = PRESETS[self.look.mode]
-        self.apply_look(replace(defaults, textures=self.look.textures, colors=self.look.colors))
+        self.apply_look(replace(defaults, textures=self.look.textures, colors=self.look.colors,
+                                style=self.look.style, bokeh=self.look.bokeh))
 
     def apply_look(self, look):
         for name, control in self.fields.items():
             control.set(getattr(look, name))
-        window = self.tool_windows.get(TexturesWindow)
-        if window is not None and window.winfo_exists():
-            window.sync(look.textures)
+        for tool, config in ((TexturesWindow, look.textures), (StyleWindow, look.style), (BokehWindow, look.bokeh)):
+            window = self.tool_windows.get(tool)
+            if window is not None and window.winfo_exists():
+                window.sync(config)
         self.read_controls(look)
 
     def apply_palette(self, colors):
@@ -464,18 +469,32 @@ class EntropyApp(tk.Tk):
     def apply_textures(self, texture):
         self.read_controls(replace(self.look, textures=texture))
 
+    def apply_style(self, style):
+        self.read_controls(replace(self.look, style=style))
+
+    def apply_bokeh(self, bokeh):
+        self.read_controls(replace(self.look, bokeh=bokeh))
+
+    def update_bokeh_button(self):
+        if self.look.mode == BOKEH:
+            if not self.bokeh_button.winfo_manager():
+                self.bokeh_button.pack(side="right", padx=(0, 5))
+        else:
+            self.bokeh_button.pack_forget()
+            window = self.tool_windows.get(BokehWindow)
+            if window is not None and window.winfo_exists():
+                window.withdraw()
+
     def apply_preset(self, look, spec):
         for name, value in asdict(spec).items():
             self.output[name].set(duration_field(value) if name == "seconds" else value)
         self.apply_look(look)
 
-    def flush_textures(self):
-        window = self.tool_windows.get(TexturesWindow)
-        if window is not None and window.winfo_exists():
-            window.flush()
-
     def capture_settings(self):
-        self.flush_textures()
+        for tool in (TexturesWindow, StyleWindow, BokehWindow):
+            window = self.tool_windows.get(tool)
+            if window is not None and window.winfo_exists():
+                window.flush()
         return self.read_controls()
 
     def schedule_controls(self, *_event):
@@ -508,6 +527,7 @@ class EntropyApp(tk.Tk):
                 self.frame_latency = None
                 self.good_streak = 0
             self.look, self.export = look, spec
+            self.update_bokeh_button()
             self.revision += 1
             self.dirty = True
             if self.job is None:
