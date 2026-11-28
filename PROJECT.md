@@ -8,6 +8,16 @@ Project Nexus is a Windows desktop app for image and object tracking in local vi
 - `nexus_app.py` and the packaged Windows executable provide drag-and-drop loading and MP4 export for whole-frame dither. The separate Project Nexus Tracking executable uses the shared CSRT core. It opens a video, accepts one on-screen box, exports a tracking-box or tracked-dither MP4 with CSV, and plays the result in the desktop window. Both modes passed the synthetic translation test. Real-footage and laptop performance verification remain pending.
 - The release order below reflects current project priorities. TASKS.md and HANDOFF.md hold ownership and handoff records. Their initial implementation status predates the CLI and desktop build.
 
+### Tracking Lab build
+
+Open `Project Nexus Tracking Lab.exe` for **Clean blobs**, **Line network**, **Motion vectors**, **Word scatter**, and **ASCII texture**. The first four draw graphics over the original footage. Soft Dots and the earlier looks remain in the Look menu. The new build starts with Clean blobs.
+
+**Live controls** groups detection, marks and links, text, and ASCII. Adjust the detector, threshold, detection interval, target count, and spacing while playing or paused. Contour-based detectors offer motion, bright, and dark blobs, with area filtering. Features use a relative corner-strength threshold. Mark and link styling updates without reseeding the active track. Detection changes can re-seed IDs.
+
+Paste any text under **Text** and split it into lines, words, or phrases. Labels are assigned by track ID and skip overlaps. Control format, font, color, density, and whether each mark is a shape, text, both, or neither. **ASCII texture** provides a custom glyph ramp, size, color, backdrop, and optional ordered dithering. ASCII without tracking marks exports just the MP4. Visual controls and pasted text are saved with Nexus presets.
+
+All four detectors and five new looks were tested separately. The 540×960 synthetic demo exported all 72 frames in each mode. Demo exports and an example custom-text preset live in `.nexus-runtime/tracking-lab-demo`. For the detection controls, see [TouchDesigner's Blob Track TOP guide](https://derivative.ca/UserGuide/Blob_Track_TOP).
+
 ### Soft Dots build
 
 `Project Nexus Soft Dots.exe` opens with **Soft Dots**, a full-frame halftone based on the supplied clip and screenshot settings. It uses a stable grid of source-colored, brightness-sized circles over a blurred image. At 2560 × 1440 the supplied export measured 13.21 px horizontally and 21.96 px vertically. The Nexus preset measured 13.19 px and 22.02 px on a clean swatch at that size.

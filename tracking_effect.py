@@ -10,7 +10,8 @@ import cv2
 import numpy as np
 
 from dots_effect import DOTS, DotsRenderer
-from scene_effects import SCENE_MODES, SceneTracker, paint_scene
+from graphics_settings import needs_scene_tracks
+from scene_effects import SCENE_MODES, SceneTracker, paint_scene, transform_track
 from studio_effects import Effect, QUALITY, box_corners, surface_frames
 from track import tracked_frames
 
@@ -27,19 +28,24 @@ def decoded_frames(capture, tracker):
         yield frame, tracker.update(frame) if tracker is not None else None
 
 
+def writes_tracking_data(look):
+    return look.mode != DOTS and needs_scene_tracks(look)
+
+
 def export_track(source, selection, destination, look, planar, cancel, progress, finalizing=None):
     positions = destination.with_suffix(".csv")
     if destination.suffix.lower() != ".mp4":
         raise ValueError("Save the output as an MP4 file.")
     is_dots = look.mode == DOTS
-    targets = (destination,) if is_dots else (destination, positions)
+    has_data = writes_tracking_data(look)
+    targets = (destination, positions) if has_data else (destination,)
     if any(path.exists() or path.is_symlink() for path in targets):
         raise ValueError("An output already exists. Choose another filename.")
     look.validate()
     automatic = look.mode in SCENE_MODES
     effect = None if automatic or is_dots else Effect(look)
     dots = DotsRenderer(look.dots) if is_dots else None
-    scene = SceneTracker(look.detail, look) if automatic else None
+    scene = SceneTracker(look.detail, look) if automatic and has_data else None
 
     capture = cv2.VideoCapture(str(source))
     try:
@@ -74,12 +80,12 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
             try:
                 if not writer.isOpened():
                     raise ValueError("Could not open the MP4 encoder.")
-                csv_file = nullcontext() if is_dots else data.open("w", encoding="utf-8", newline="")
+                csv_file = data.open("w", encoding="utf-8", newline="") if has_data else nullcontext()
                 with csv_file as stream:
                     rows = csv.writer(stream) if stream is not None else None
                     header = ("frame", "status", "x", "y", "width", "height")
                     corners = ("tl_x", "tl_y", "tr_x", "tr_y", "br_x", "br_y", "bl_x", "bl_y")
-                    if automatic:
+                    if automatic and rows is not None:
                         rows.writerow(("frame", "status", "id", "center_x", "center_y", "radius"))
                     elif rows is not None:
                         rows.writerow(header + corners if planar else header)
@@ -89,9 +95,9 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                         if frame.shape[:2] != (height, width):
                             raise ValueError("The video size changed during tracking.")
                         quad = None
-                        if automatic:
+                        if automatic and rows is not None:
                             if region:
-                                for identity, center, radius, _ in region:
+                                for identity, center, radius, _, _ in region:
                                     rows.writerow((index, "tracked", identity,
                                                    round(float(center[0]), 2), round(float(center[1]), 2),
                                                    round(radius, 2)))
@@ -115,10 +121,11 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                             if quad is not None:
                                 quad = quad * factors
                         if automatic:
+                            region = region or ()
                             if resize:
-                                region = [(identity, center * factors, radius * scale, trail * factors)
-                                          for identity, center, radius, trail in region]
-                            frame = paint_scene(frame, region, look, index, fps, scene.crop_ids)
+                                region = [transform_track(track, factors) for track in region]
+                            frame = paint_scene(frame, region, look, index, fps,
+                                                scene.crop_ids if scene is not None else None)
                         elif is_dots:
                             frame = dots.frame(frame)
                         else:
@@ -144,7 +151,7 @@ def export_track(source, selection, destination, look, planar, cancel, progress,
                 check.release()
             if cancel.is_set():
                 raise Cancelled
-            if is_dots:
+            if not has_data:
                 preview.rename(destination)
                 return count, lost
             positions = data.rename(positions)

@@ -10,6 +10,7 @@ import numpy as np
 
 from dither import BAYER
 from dots_effect import DOTS, DotsSettings
+from graphics_settings import ASCII, CLEAN, NETWORK, VECTORS, WORDS, Graphics
 from scene_effects import ARCHIVE, CCTV, POETIC, SCENE_MODES, THERMAL, WEB
 
 
@@ -43,6 +44,7 @@ class Look:
     trails: bool = True
     crops: bool = True
     dots: DotsSettings = field(default_factory=DotsSettings)
+    graphics: Graphics = field(default_factory=Graphics)
 
     def validate(self):
         if self.mode not in MODES or self.quality not in QUALITY:
@@ -68,10 +70,24 @@ class Look:
         if not isinstance(self.dots, DotsSettings):
             raise ValueError("Invalid soft dots settings.")
         self.dots.validate()
+        if not isinstance(self.graphics, Graphics):
+            raise ValueError("Invalid tracking graphics settings.")
+        self.graphics.validate()
         return self
 
 
 SCENE_LOOKS = {
+    CLEAN: Look(CLEAN, 95, 6, "#E9FFF4", min_boxes=4, max_boxes=16, links=False,
+                graphics=Graphics(marks="Boxes", box_scale=80)),
+    NETWORK: Look(NETWORK, 84, 9, "#BEEFF4", min_boxes=4, max_boxes=24,
+                  graphics=Graphics(marks="None", line_style="Curved", link_density=2, link_range=36)),
+    VECTORS: Look(VECTORS, 96, 9, "#A6FCD1", min_boxes=4, max_boxes=24, links=False,
+                  graphics=Graphics(marks="None", vector_gain=135)),
+    WORDS: Look(WORDS, 100, 5, "#F9F0D8", min_boxes=4, max_boxes=18, links=False,
+                graphics=Graphics(marks="Text", label_style="Serif italic", label_source="Custom",
+                                  label_density=75, label_size=110)),
+    ASCII: Look(ASCII, 100, 8, "#9CF9CE", min_boxes=0, max_boxes=20, links=False, labels=False,
+                graphics=Graphics(marks="None")),
     CCTV: Look(CCTV, 100, 9, "#B8CFED", max_boxes=27),
     WEB: Look(WEB, 100, 20, "#66E8EF", max_boxes=49),
     ARCHIVE: Look(ARCHIVE, 100, 13, "#FFF3C9", max_boxes=35),
@@ -83,6 +99,9 @@ FULL_FRAME_LOOKS = {DOTS: DOTS_LOOK, **SCENE_LOOKS}
 PRESETS = {
     "Soft Dots · Reference": DOTS_LOOK,
     **SCENE_LOOKS,
+    "Motion blobs": Look(CLEAN, 95, 6, "#E9FFF4", min_boxes=0, max_boxes=18, links=False,
+                          graphics=Graphics(detector="Motion blobs", threshold=13, interval=3,
+                                            min_size=2, marks="Boxes", box_scale=115)),
     "Tracking guide": Look(),
     "Mint halftone": Look(DITHER, 92, 4, "#8AFFCA"),
     "Amber signal": Look(SIGNAL, 83, 12, "#FFC05C"),
@@ -101,6 +120,10 @@ def load_preset(path):
             if not isinstance(fields["dots"], dict):
                 raise ValueError("Invalid soft dots settings.")
             fields["dots"] = DotsSettings(**fields["dots"])
+        if "graphics" in fields:
+            if not isinstance(fields["graphics"], dict):
+                raise ValueError("Invalid tracking graphics settings.")
+            fields["graphics"] = Graphics(**fields["graphics"])
         if fields.get("mode") in SCENE_MODES and "max_boxes" not in fields:
             detail = fields.get("detail", Look().detail)
             if type(detail) is int and 2 <= detail <= 24:

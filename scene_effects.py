@@ -7,13 +7,17 @@ from math import hypot
 import cv2
 import numpy as np
 
+from blob_detection import BlobTracker, Region
+from graphic_looks import paint_graphics
+from graphics_settings import GRAPHIC_MODES, Graphics
+
 
 CCTV = "CCTV collage"
 WEB = "Signal web"
 ARCHIVE = "Amber archive"
 THERMAL = "Thermal scan"
 POETIC = "Poetic traces"
-SCENE_MODES = (CCTV, WEB, ARCHIVE, THERMAL, POETIC)
+SCENE_MODES = (*GRAPHIC_MODES, CCTV, WEB, ARCHIVE, THERMAL, POETIC)
 PHRASES = (
     "A trace of motion", "The light moves on", "Still in view",
     "Where the frame ends", "A moment held", "Between two signals",
@@ -51,12 +55,20 @@ class SceneTracker:
         self.crop_ids = [None, None]
         self.next_id = 1
         self.count = 0
+        self.config = Graphics()
+        self.blobs = None
+        self.last_detection = -1000
+        self.configure(density, look)
+
+    def configure(self, density, look):
+        self.config = look.graphics if look is not None else Graphics()
         self.limit = look.max_boxes if look is not None else 9 + density * 2
         self.minimum = look.min_boxes if look is not None else min(12, self.limit)
-        response = look.tracking_speed if look is not None else 65
-        self.alpha = .20 + .80 * response / 100
-        self.reseed_interval = max(2, round(12 - response / 10))
-        self.spacing = max(7, min(38 - density, round(105 / self.limit ** .5)))
+        self.response = look.tracking_speed if look is not None else 65
+        self.alpha = .20 + .80 * self.response / 100
+        self.reseed_interval = self.config.interval
+        self.spacing = max(6, min(38 - density, round(105 / self.limit ** .5)))
+        self.points = self.points[:self.limit]
 
     def update(self, frame):
         height, width = frame.shape[:2]
@@ -64,6 +76,12 @@ class SceneTracker:
         size = (max(1, round(width * scale)), max(1, round(height * scale)))
         image = cv2.resize(frame, size, interpolation=cv2.INTER_AREA) if size != (width, height) else frame
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        inverse = np.float32((width / size[0], height / size[1]))
+        if self.config.detector != "Features":
+            if self.blobs is None:
+                self.blobs = BlobTracker()
+            return [transform_track(region, inverse) for region in
+                    self.blobs.update(gray, self.config, self.limit, self.response)]
 
         if self.points and self.previous is not None:
             positions = np.float32([point.position for point in self.points]).reshape(-1, 1, 2)
@@ -82,36 +100,40 @@ class SceneTracker:
                             survivor.append(point)
             self.points = survivor
 
-        if (len(self.points) < self.minimum or not self.points
-                or (self.count % self.reseed_interval == 0 and len(self.points) < self.limit)):
+        if self.count - self.last_detection >= self.reseed_interval and len(self.points) < self.limit:
+            self.last_detection = self.count
+            spacing = max(self.spacing, round(min(size) * self.config.spacing / 100))
+            quality = .003 + (self.config.threshold / 254) ** 2.25 * .92
             mask = np.full(gray.shape, 255, dtype=np.uint8)
             border = min(14, max(3, min(size) // 12))
             mask[:border] = mask[-border:] = 0
             mask[:, :border] = mask[:, -border:] = 0
             for point in self.points:
-                cv2.circle(mask, tuple(np.rint(point.position).astype(int)), self.spacing, 0, -1)
+                cv2.circle(mask, tuple(np.rint(point.position).astype(int)), spacing, 0, -1)
             corners = cv2.goodFeaturesToTrack(
-                gray, maxCorners=self.limit - len(self.points), qualityLevel=.012,
-                minDistance=self.spacing, mask=mask,
+                gray, maxCorners=self.limit - len(self.points), qualityLevel=quality,
+                minDistance=spacing, mask=mask,
             )
             self.add_points(corners)
             if len(self.points) < self.minimum:
-                spacing = max(4, self.spacing // 2)
+                spacing = max(4, spacing // 2)
                 mask.fill(255)
                 mask[:border] = mask[-border:] = 0
                 mask[:, :border] = mask[:, -border:] = 0
                 for point in self.points:
                     cv2.circle(mask, tuple(np.rint(point.position).astype(int)), spacing, 0, -1)
                 self.add_points(cv2.goodFeaturesToTrack(
-                    gray, maxCorners=self.minimum - len(self.points), qualityLevel=.004,
+                    gray, maxCorners=self.minimum - len(self.points), qualityLevel=quality,
                     minDistance=spacing, mask=mask,
                 ))
 
         self.count += 1
         self.previous = gray
-        inverse = np.float32((width / size[0], height / size[1]))
-        return [(point.id, point.smooth * inverse, point.size * float(inverse.mean()),
-                 np.array(point.trail) * inverse) for point in self.points]
+        return [
+            transform_track(Region(point.id, point.smooth, point.size, np.array(point.trail),
+                                   np.float32((2 * point.size, 1.6 * point.size))), inverse)
+            for point in self.points
+        ]
 
 
     def add_points(self, points):
@@ -122,6 +144,11 @@ class SceneTracker:
             self.points.append(Point(self.next_id, position.copy(), position.copy(),
                                      radius, deque([position.copy()], maxlen=12)))
             self.next_id += 1
+
+
+def transform_track(track, factors):
+    return Region(track.id, track.position * factors, track.size * float(np.mean(factors)),
+                  track.trail * factors, track.extent * factors)
 
 
 def grade(frame, mode, tick):
@@ -200,7 +227,7 @@ def crop_windows(image, source, tracks, tone, font, unit, anchors):
         if anchor is None:
             anchor = min(available.values(),
                          key=lambda item: hypot((item[1][0] - side) * .6, item[1][1] - y))
-        identity, center, radius, _ = anchor
+        identity, center, radius, _, _ = anchor
         anchors[index] = identity
         used.add(identity)
         px, py = np.rint(center).astype(int)
@@ -220,6 +247,8 @@ def crop_windows(image, source, tracks, tone, font, unit, anchors):
 def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
     if not look.opacity:
         return frame
+    if look.mode in GRAPHIC_MODES:
+        return paint_graphics(frame, tracks, look, index)
     height, width = frame.shape[:2]
     unit = max(1, round(min(height, width) / 660))
     font = max(.3, min(height, width) / 1650)
@@ -258,7 +287,7 @@ def paint_scene(frame, tracks, look, index, fps, crop_ids=None):
                 point = np.rint(off * (1 - phase) + end * phase).astype(int)
                 cv2.circle(image, tuple(point), 2 * unit, tint, -1, cv2.LINE_AA)
 
-    for identity, position, radius, trail in tracks:
+    for identity, position, radius, trail, _ in tracks:
         x, y = np.rint(position).astype(int)
         size = max(4, round(radius * (.55 if mode == WEB else .93)))
         ratio = 0.65 + ((identity * 7) % 6) * .16

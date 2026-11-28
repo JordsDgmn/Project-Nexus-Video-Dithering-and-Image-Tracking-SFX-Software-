@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from dots_effect import DOTS, DotsRenderer
+from graphics_settings import needs_scene_tracks
 from scene_effects import SCENE_MODES, SceneTracker, paint_scene
 from studio_effects import Effect, box_corners, surface_frames
 from track import tracked_frames
@@ -94,10 +95,35 @@ class Stream:
         self.last = None
         self.fps = self.capture.get(cv2.CAP_PROP_FPS) or 30
         self.auto = spec.look is not None and spec.look.mode in SCENE_MODES
+        self.track = self.auto and needs_scene_tracks(spec.look)
         self.dots = DotsRenderer(spec.look.dots) if spec.look is not None and spec.look.mode == DOTS else None
         self.manual = (spec.look is not None and self.dots is None
                        and not self.auto and spec.selection is not None)
         self.tracker = self.iterator = self.effect = None
+        self.raw = None
+        self.tracks = ()
+
+    def retune(self, spec):
+        if not (self.auto and spec.path == self.spec.path and spec.look is not None
+                and spec.look.mode in SCENE_MODES):
+            return False
+        old, new = self.spec.look, spec.look
+        self.spec = spec
+        track = needs_scene_tracks(new)
+        changed = track != self.track
+        self.track = track
+        if self.track and (changed or old.graphics.detection_key() != new.graphics.detection_key()
+                           or old.detail != new.detail):
+            self.tracker = None
+            self.last = None
+        else:
+            if self.track and self.tracker is not None:
+                self.tracker.configure(new.detail, new)
+            if self.raw is not None:
+                self.tracks = self.tracks[:new.max_boxes] if self.track else ()
+                self.last = paint_scene(self.raw, self.tracks, new, self.index, self.fps,
+                                        self.tracker.crop_ids if self.track and self.tracker else None)
+        return True
 
     def close(self):
         self.capture.release()
@@ -112,7 +138,7 @@ class Stream:
     def frame_at(self, target, cancelled, progress):
         if target == self.index and self.last is not None:
             return self.last
-        if self.auto and (self.tracker is None or target < self.index or target > self.index + 15):
+        if self.track and (self.tracker is None or target < self.index or target > self.index + 15):
             self.jump(max(0, target - 10))
             self.tracker = SceneTracker(self.spec.look.detail, self.spec.look)
         elif self.manual and (self.iterator is None or target < self.index):
@@ -122,7 +148,7 @@ class Stream:
                 self.iterator = surface_frames(self.capture, self.spec.selection)
             else:
                 self.iterator = tracked_frames(self.capture, self.spec.selection, max_tracking_edge=960)
-        elif not (self.auto or self.manual) and target != self.index + 1:
+        elif not (self.track or self.manual) and target != self.index + 1:
             self.jump(target)
 
         while self.index < target:
@@ -146,9 +172,10 @@ class Stream:
                     raise EOFError
                 frame = preview_size(original)
                 if self.auto:
-                    tracks = self.tracker.update(frame)
-                    frame = paint_scene(frame, tracks, self.spec.look, self.index + 1,
-                                        self.fps, self.tracker.crop_ids)
+                    self.raw = frame
+                    self.tracks = self.tracker.update(frame) if self.track else ()
+                    frame = paint_scene(frame, self.tracks, self.spec.look, self.index + 1,
+                                        self.fps, self.tracker.crop_ids if self.track else None)
                 elif self.dots is not None:
                     frame = self.dots.frame(frame)
             self.index += 1
@@ -217,10 +244,10 @@ class PreviewWorker:
                         result = inspect_clip(args[0])
                     else:
                         spec, frame = args
-                        if stream is None or stream.spec != spec:
-                            if stream is not None:
-                                stream.close()
-                                stream = None
+                        if stream is not None and stream.spec != spec and not stream.retune(spec):
+                            stream.close()
+                            stream = None
+                        if stream is None:
                             stream = Stream(spec)
                         result = frame, stream.frame_at(frame, cancelled, report)
                 except Superseded:

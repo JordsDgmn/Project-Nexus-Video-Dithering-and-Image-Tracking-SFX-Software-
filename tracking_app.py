@@ -1,5 +1,6 @@
 """Project Nexus desktop workflow for region tracking and effects."""
 
+from dataclasses import replace as with_settings
 import math
 import os
 from pathlib import Path
@@ -16,15 +17,17 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from dots_effect import DOTS
 from dots_panel import DotsPanel
+from graphics_panel import GraphicsPanel
+from graphics_settings import CLEAN, GRAPHIC_MODES
 from nexus_diagnostics import DiagnosticsWindow, clock
 from nexus_preview import PreviewSpec, PreviewWorker
 from scene_effects import CCTV, SCENE_MODES
 from studio_effects import (
-    ARTWORK, AUTO, DOTS_LOOK, FULL_FRAME_LOOKS, FULL_FRAME_MODES, MODES, OUTLINE,
+    ARTWORK, AUTO, FULL_FRAME_LOOKS, FULL_FRAME_MODES, MODES, OUTLINE,
     PRESETS, QUALITY, SCENE_LOOKS, SUBJECT, SURFACE, Look,
     load_preset, save_preset, valid_quad,
 )
-from tracking_effect import Cancelled, export_track
+from tracking_effect import Cancelled, export_track, writes_tracking_data
 
 
 BG = "#111827"
@@ -36,7 +39,7 @@ ACCENT = "#78edbe"
 class TrackingApp(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Project Nexus — Auto Looks")
+        self.title("Project Nexus — Tracking Lab")
         self.geometry("1100x780")
         self.minsize(920, 650)
         self.configure(bg=BG)
@@ -44,7 +47,7 @@ class TrackingApp(TkinterDnD.Tk):
         self.source = self.first = self.image = self.bounds = None
         self.anchor = self.box = self.selection = None
         self.result = self.play_job = self.scrub_job = self.preview_poll = None
-        self.clip = self.displayed = self.inspector = self.dots_panel = None
+        self.clip = self.displayed = self.inspector = self.dots_panel = self.graphics_panel = None
         self.worker = PreviewWorker()
         self.preview_token = self.pending_since = None
         self.preview_stats = self.preview_fps = self.last_presented = None
@@ -57,8 +60,8 @@ class TrackingApp(TkinterDnD.Tk):
         self.render_last_sample = None
         self.cancel = Event()
         self.events = Queue()
-        defaults = DOTS_LOOK
-        self.dots = defaults.dots
+        defaults = FULL_FRAME_LOOKS[CLEAN]
+        self.dots, self.graphics = defaults.dots, defaults.graphics
         self.mode = tk.StringVar(value=defaults.mode)
         self.target = tk.StringVar(value=AUTO)
         self.quality = tk.StringVar(value=defaults.quality)
@@ -97,6 +100,8 @@ class TrackingApp(TkinterDnD.Tk):
         self.inspector_button.pack(side="right", padx=(8, 0))
         self.settings_toggle = self.button(top, "Advanced", self.toggle_settings)
         self.settings_toggle.pack(side="right")
+        self.graphics_button = self.button(top, "Live controls", self.open_graphics)
+        self.graphics_button.pack(side="right", padx=(8, 0))
         self.dots_button = self.button(top, "Dots settings", self.open_dots)
         self.dots_button.pack(side="right", padx=8)
         self.open_button = self.button(top, "Open video…", self.browse)
@@ -222,6 +227,32 @@ class TrackingApp(TkinterDnD.Tk):
             self.inspector.deiconify()
             self.inspector.lift()
 
+    def open_graphics(self):
+        if self.mode.get() not in GRAPHIC_MODES or self.busy:
+            return
+        if self.graphics_panel is None:
+            self.graphics_panel = GraphicsPanel(self, self.current_look())
+        else:
+            self.graphics_panel.deiconify()
+            self.graphics_panel.lift()
+
+    def apply_graphics(self, config, values):
+        if self.busy or self.mode.get() not in GRAPHIC_MODES:
+            raise ValueError("Live controls are available in the tracking looks before export.")
+        look = with_settings(self.current_look(), graphics=config, **values).validate()
+        self.graphics = look.graphics
+        self.tint = look.tint
+        for key in ("opacity", "tracking_speed", "min_boxes", "max_boxes", "links", "labels", "trails"):
+            getattr(self, key).set(getattr(look, key))
+        if self.clip is None or self.loading_clip or self.compare.get():
+            return
+        if self.preview_playing and self.preview_channel == "source":
+            # The next frame request takes the current settings without pausing playback.
+            return
+        self.pause_preview()
+        self.preview_channel = "source"
+        self.request_frame(self.position)
+
     def open_dots(self):
         if self.mode.get() != DOTS or self.busy:
             return
@@ -258,7 +289,12 @@ class TrackingApp(TkinterDnD.Tk):
     def choose_look(self, _event=None):
         mode = self.mode.get()
         if mode in FULL_FRAME_MODES:
-            self.set_look(FULL_FRAME_LOOKS[mode], keep_quality=True)
+            look = FULL_FRAME_LOOKS[mode]
+            if mode in GRAPHIC_MODES and self.graphics.custom_text:
+                look = with_settings(look, graphics=with_settings(
+                    look.graphics, custom_text=self.graphics.custom_text
+                ))
+            self.set_look(look, keep_quality=True)
         elif self.target.get() == AUTO:
             self.target.set(SUBJECT)
             self.change_target()
@@ -278,6 +314,7 @@ class TrackingApp(TkinterDnD.Tk):
                 animation_speed=self.animation_speed.get(), min_boxes=self.min_boxes.get(),
                 max_boxes=self.max_boxes.get(), links=self.links.get(), labels=self.labels.get(),
                 trails=self.trails.get(), crops=self.crops.get(), dots=self.dots,
+                graphics=self.graphics,
             ).validate()
         except tk.TclError as error:
             raise ValueError("Enter whole numbers for opacity and detail size.") from error
@@ -285,6 +322,10 @@ class TrackingApp(TkinterDnD.Tk):
     def change_effect(self, _event=None):
         is_dots = self.mode.get() == DOTS
         self.dots_button.configure(state="normal" if is_dots and not self.busy else "disabled")
+        is_graphics = self.mode.get() in GRAPHIC_MODES
+        self.graphics_button.configure(state="normal" if is_graphics and not self.busy else "disabled")
+        if not is_graphics and self.graphics_panel is not None:
+            self.graphics_panel.close()
         if not is_dots and self.dots_panel is not None:
             self.dots_panel.close()
         self.image_button.configure(state="normal" if self.mode.get() == ARTWORK else "disabled")
@@ -323,7 +364,9 @@ class TrackingApp(TkinterDnD.Tk):
         for field in ("opacity", "detail", "tracking_speed", "animation_speed",
                       "min_boxes", "max_boxes", "links", "labels", "trails", "crops"):
             getattr(self, field).set(getattr(look, field))
-        self.tint, self.artwork, self.dots = look.tint, look.artwork, look.dots
+        self.tint, self.artwork, self.dots, self.graphics = look.tint, look.artwork, look.dots, look.graphics
+        if self.graphics_panel is not None and look.mode in GRAPHIC_MODES:
+            self.graphics_panel.synchronize(look)
         if self.dots_panel is not None and look.mode == DOTS:
             self.dots_panel.set_settings(self.dots)
         if changed_target:
@@ -580,6 +623,8 @@ class TrackingApp(TkinterDnD.Tk):
         if (self.busy or self.loading_clip or self.source is None
                 or (self.box is None and self.target.get() != AUTO)):
             return
+        if self.graphics_panel is not None:
+            self.graphics_panel.flush()
         self.stop_preview()
         try:
             look = self.current_look()
@@ -589,15 +634,16 @@ class TrackingApp(TkinterDnD.Tk):
             self.status.set(str(error))
             return
         planar = self.target.get() == SURFACE
-        is_dots = look.mode == DOTS
-        stem = f"{self.source.stem}-{'dots' if is_dots else 'tracked'}"
+        has_data = writes_tracking_data(look)
+        suffix = "dots" if look.mode == DOTS else "tracked" if has_data else "ascii"
+        stem = f"{self.source.stem}-{suffix}"
         candidate = self.source.with_name(f"{stem}.mp4")
         index = 2
-        while candidate.exists() or (not is_dots and candidate.with_suffix(".csv").exists()):
+        while candidate.exists() or (has_data and candidate.with_suffix(".csv").exists()):
             candidate = self.source.with_name(f"{stem}-{index}.mp4")
             index += 1
         path = filedialog.asksaveasfilename(
-            parent=self, title="Save Soft Dots video" if is_dots else "Save tracked video and its companion CSV",
+            parent=self, title="Save tracked video and its companion CSV" if has_data else "Save effect video",
             initialdir=candidate.parent, initialfile=candidate.name,
             defaultextension=".mp4", filetypes=[("MP4 video", "*.mp4")],
         )
@@ -605,7 +651,10 @@ class TrackingApp(TkinterDnD.Tk):
             return
         if self.dots_panel is not None:
             self.dots_panel.close()
+        if self.graphics_panel is not None:
+            self.graphics_panel.close()
         self.dots_button.configure(state="disabled")
+        self.graphics_button.configure(state="disabled")
         self.result = None
         self.busy = True
         self.cancel.clear()
@@ -659,7 +708,7 @@ class TrackingApp(TkinterDnD.Tk):
             if kind == "finalizing":
                 if not self.cancel.is_set():
                     self.activity = "Finalizing export"
-                    self.status.set("Finalizing MP4…" if self.last_render_look.mode == DOTS else
+                    self.status.set("Finalizing MP4…" if not writes_tracking_data(self.last_render_look) else
                                     "Finalizing MP4 and tracking data…")
                 continue
             self.busy = False
@@ -715,7 +764,7 @@ class TrackingApp(TkinterDnD.Tk):
             return
         if total and count >= total:
             self.activity = "Finalizing export"
-            self.status.set("Finalizing MP4…" if self.last_render_look.mode == DOTS else
+            self.status.set("Finalizing MP4…" if not writes_tracking_data(self.last_render_look) else
                                     "Finalizing MP4 and tracking data…")
             return
         self.activity = "Rendering"
@@ -728,7 +777,7 @@ class TrackingApp(TkinterDnD.Tk):
 
     def summary(self):
         duration = clock(self.render_stats.get("elapsed"))
-        if self.last_render_look.mode == DOTS:
+        if not writes_tracking_data(self.last_render_look):
             return f"Saved {self.result.name} in {duration} · {self.count:,} frames."
         return f"Saved {self.result.name} and CSV in {duration}. {len(self.lost):,} of {self.count:,} frames lost."
 
@@ -951,6 +1000,8 @@ class TrackingApp(TkinterDnD.Tk):
                 self.inspector.close()
             if self.dots_panel is not None:
                 self.dots_panel.close()
+            if self.graphics_panel is not None:
+                self.graphics_panel.close()
             self.destroy()
 
 
