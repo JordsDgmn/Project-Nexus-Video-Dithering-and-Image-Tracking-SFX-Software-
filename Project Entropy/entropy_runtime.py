@@ -12,7 +12,7 @@ import traceback
 
 import cv2
 
-from entropy_engine import ExportSpec, Look, Simulator
+from entropy_engine import ExportSpec, Simulator, decode_look
 
 
 class Cancelled(Exception):
@@ -152,10 +152,14 @@ def export_clip(path, look, spec, cancel, report):
     return perf_counter() - start
 
 
-def save_preset(path, look, export):
+def preset_document(look, export):
     look.validate()
     export.validate()
-    body = {"version": 1, "look": asdict(look), "export": asdict(export)}
+    return {"version": 1, "look": asdict(look), "export": asdict(export)}
+
+
+def save_preset(path, look, export):
+    body = preset_document(look, export)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", delete=False, dir=path.parent,
@@ -172,9 +176,13 @@ def save_preset(path, look, export):
 def load_preset(path):
     with path.open(encoding="utf-8") as stream:
         data = json.load(stream)
+    return decode_preset(data)
+
+
+def decode_preset(data):
     if not isinstance(data, dict) or data.get("version") != 1:
         raise ValueError("This file is not an Entropy preset.")
     try:
-        return Look(**data["look"]).validate(), ExportSpec(**data["export"]).validate()
+        return decode_look(data["look"]), ExportSpec(**data["export"]).validate()
     except (TypeError, KeyError) as error:
         raise ValueError("The preset contains unknown settings.") from error

@@ -1,6 +1,6 @@
 """Seeded, seamless light fields for Project Entropy."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 import re
@@ -8,12 +8,20 @@ import re
 import cv2
 import numpy as np
 
+from entropy_texture import Texture, TextureStack
+
+
+MAX_EXPORT_SECONDS = 30 * 60
+
 
 AURA = "Prismatic aura"
 OIL = "Iridescent oil"
 GLASS = "Glass caustics"
 POOL = "Pool reflections"
-MODES = (AURA, OIL, GLASS, POOL)
+PRISM = "Prism refraction"
+BOKEH = "Cinematic bokeh"
+CUSTOM = "Custom palette"
+MODES = (AURA, OIL, GLASS, POOL, PRISM, BOKEH)
 BLENDS = ("Screen", "Add", "Soft light", "Multiply", "Overlay", "Normal")
 RATIOS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:5": (4, 5),
           "4:3": (4, 3), "21:9": (21, 9)}
@@ -24,6 +32,7 @@ PALETTES = {
     "Solar": ("#981C62", "#FF594F", "#FFA13C", "#FFF5C1", "#FFD27A", "#981C62"),
     "Ultraviolet": ("#37118E", "#7147E3", "#B05AFF", "#FFA0EF", "#91ADF9", "#37118E"),
     "Neutral": ("#9FB6CE", "#DDEEF5", "#FFF9EE", "#BFC9DA", "#9FB6CE"),
+    "Cinema": ("#FFAA58", "#FFE5B1", "#6EC5CE", "#4987A7", "#F47C67", "#FFAA58"),
 }
 
 
@@ -43,9 +52,11 @@ class Look:
     background: str = "#10091E"
     cycles: int = 1
     seed: int = 17
+    colors: tuple = ()
+    textures: Texture = field(default_factory=Texture)
 
     def validate(self):
-        if self.mode not in MODES or self.palette not in PALETTES or self.blend not in BLENDS:
+        if self.mode not in MODES or self.palette not in (*PALETTES, CUSTOM) or self.blend not in BLENDS:
             raise ValueError("Choose a supported effect, palette and blend mode.")
         for key, low, high in (
             ("hue", -180, 180), ("spectrum", 1, 200), ("saturation", 0, 150),
@@ -57,7 +68,34 @@ class Look:
                 raise ValueError(f"{key.capitalize()} must be {low} to {high}.")
         if not isinstance(self.background, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", self.background):
             raise ValueError("Background color needs six hexadecimal digits.")
+        if self.colors or self.palette == CUSTOM:
+            validate_colors(self.colors)
+        if not isinstance(self.textures, Texture):
+            raise ValueError("Invalid texture settings.")
+        self.textures.validate()
         return self
+
+
+def validate_colors(colors):
+    if not isinstance(colors, (tuple, list)) or not 1 <= len(colors) <= 10:
+        raise ValueError("A palette needs 1 to 10 colors.")
+    if any(not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color) for color in colors):
+        raise ValueError("Use a six-digit color such as #ACCFEF.")
+    return tuple(color.upper() for color in colors)
+
+
+def decode_look(data):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid look settings.")
+    values = dict(data)
+    if "colors" in values:
+        raw = values["colors"]
+        values["colors"] = validate_colors(raw) if raw else ()
+    if "textures" in values:
+        if not isinstance(values["textures"], dict):
+            raise ValueError("Invalid texture settings.")
+        values["textures"] = Texture(**values["textures"])
+    return Look(**values).validate()
 
 
 PRESETS = {
@@ -68,6 +106,10 @@ PRESETS = {
                 "Screen", "#10162E", 1, 42),
     POOL: Look(POOL, "Lagoon", -14, 96, 91, 72, 59, 32, 53, 110,
                "Screen", "#1A7584", 1, 28),
+    PRISM: Look(PRISM, "Full spectrum", -9, 112, 108, 78, 60, 84, 34, 104,
+                "Screen", "#100D20", 1, 234),
+    BOKEH: Look(BOKEH, "Cinema", 0, 106, 97, 55, 43, 62, 52, 130,
+                "Screen", "#110E19", 1, 281),
 }
 
 
@@ -82,8 +124,10 @@ class ExportSpec:
     def validate(self):
         if self.ratio not in RATIOS or self.pixels not in (720, 1080, 1440):
             raise ValueError("Choose a supported aspect ratio and resolution.")
-        if self.fps not in (24, 30, 60) or type(self.seconds) is not int or not 1 <= self.seconds <= 30:
-            raise ValueError("Choose 24, 30 or 60 fps and a duration from 1 to 30 seconds.")
+        if self.fps not in (24, 30, 60):
+            raise ValueError("Choose 24, 30 or 60 fps.")
+        if type(self.seconds) is not int or not 1 <= self.seconds <= MAX_EXPORT_SECONDS:
+            raise ValueError("Duration must be between 1 second and 30 minutes.")
         if self.quality not in ("Balanced", "Fine", "Native"):
             raise ValueError("Choose Balanced, Fine or Native rendering.")
         return self
@@ -119,7 +163,9 @@ def rgb(hex_color):
 
 @lru_cache(maxsize=96)
 def spectral_lut(palette, saturation):
-    colors = np.float32([rgb(color) for color in PALETTES[palette]])
+    if palette[-1] != palette[0] or len(palette) == 1:
+        palette = (*palette, palette[0])
+    colors = np.float32([rgb(color) for color in palette])
     coordinates = np.linspace(0, 1, len(colors))
     values = np.linspace(0, 1, 2048)
     table = np.column_stack([np.interp(values, coordinates, colors[:, channel]) for channel in range(3)])
@@ -137,51 +183,80 @@ def phases(seed):
     return np.random.default_rng(seed).uniform(0, math.tau, 20).astype(np.float32)
 
 
+@lru_cache(maxsize=36)
+def bokeh_lights(seed):
+    lights = np.random.default_rng(np.random.SeedSequence((seed, 117))).random((64, 6), dtype=np.float32)
+    lights[:, :2] = lights[:, :2] - .5
+    return lights
+
+
+@lru_cache(maxsize=112)
+def bokeh_stamp(radius, blur):
+    half = max(4, round(radius * (1.30 + blur*.11)))
+    values = np.arange(-half, half+1, dtype=np.float32) / radius
+    distance = np.hypot(values[None, :], values[:, None])
+    softness = .045 + .082*blur
+    disc = .70 * (1 - smooth(1-softness, 1+softness, distance))
+    glow = np.exp(-(distance/(.80 + blur*.105))**2) * (.15 + .04*blur)
+    rim = np.exp(-((distance - .86) / (.073 + .035*blur))**2)*(.28 - .041*blur)
+    feather = 1 - smooth(half/radius-.29, half/radius, distance)
+    return (disc * (.48 + .52*np.clip(distance, 0, 1)) + glow + rim) * feather
+
+
 class Simulator:
     def __init__(self, size):
         self.width, self.height = size
-        short = min(size)
+        short = self.short = min(size)
         self.x = (np.arange(self.width, dtype=np.float32)[None, :] + .5 - self.width / 2) / short
         self.y = (np.arange(self.height, dtype=np.float32)[:, None] + .5 - self.height / 2) / short
         self.aspect_x, self.aspect_y = self.width / short, self.height / short
         self.edge = np.exp(-.48 * ((2 * self.x / self.aspect_x) ** 2 + (2 * self.y / self.aspect_y) ** 2))
         self.noise = np.random.default_rng(815).uniform(-.0018, .0018, (self.height, self.width)).astype(np.float32)
+        self.textures = None
 
     def color(self, field, look):
         phase = np.remainder(.49 + (field - .49) * (look.spectrum / 100) + look.hue / 360, 1)
-        return spectral_lut(look.palette, look.saturation)[np.minimum(2047, (phase * 2048).astype(np.int32))]
+        palette = look.colors if look.palette == CUSTOM else PALETTES[look.palette]
+        return spectral_lut(tuple(palette), look.saturation)[np.minimum(2047, (phase * 2048).astype(np.int32))]
 
     def frame(self, turn, look):
-        t = math.tau * ((turn % 1) * look.cycles % 1)
+        position = (turn % 1) * look.cycles % 1
+        t = math.tau * position
         phase = phases(look.seed)
         scatter = look.scatter / 100
         density = 2 ** ((look.compact - 48) / 34)
-        if look.mode == AURA:
-            energy, hue, white, ground = self.aura(t, phase, scatter, density)
-        elif look.mode == OIL:
-            energy, hue, white, ground = self.oil(t, phase, scatter, density)
-        elif look.mode == GLASS:
-            energy, hue, white, ground = self.glass(t, phase, scatter, density, look.dispersion / 100)
+        if look.mode == BOKEH:
+            emission, ground = self.bokeh(t, look, scatter, density)
+            light = np.clip(emission * 2.1, 0, 1) if look.blend == "Multiply" else None
         else:
-            energy, hue, white, ground = self.pool(t, phase, scatter, density, look.dispersion / 100)
-        dispersion = look.dispersion / 100
-        if look.mode in (AURA, OIL):
-            hue = .49 + (hue - .49) * (.82 + .33 * dispersion)
-        light = self.color(hue, look)
-        if look.mode in (GLASS, POOL):
-            # Small wavelength-dependent offsets are drawn from the same light field.
-            offset = max(0, min(13, round(min(self.width, self.height) * .011 * dispersion)))
-            if offset:
-                r = np.pad(energy[:, :-offset], ((0, 0), (offset, 0)), mode="edge")
-                b = np.pad(energy[:, offset:], ((0, 0), (0, offset)), mode="edge")
-                emission = light * np.stack((r, energy, b), axis=-1)
-                emission = cv2.addWeighted(emission, .55 + .40 * dispersion, light * energy[:, :, None],
-                                           .45 - .40 * dispersion, 0)
+            if look.mode == AURA:
+                energy, hue, white, ground = self.aura(t, phase, scatter, density)
+            elif look.mode == OIL:
+                energy, hue, white, ground = self.oil(t, phase, scatter, density)
+            elif look.mode == GLASS:
+                energy, hue, white, ground = self.glass(t, phase, scatter, density, look.dispersion / 100)
+            elif look.mode == PRISM:
+                energy, hue, white, ground = self.prism(t, phase, scatter, density, look.dispersion / 100)
+            else:
+                energy, hue, white, ground = self.pool(t, phase, scatter, density, look.dispersion / 100)
+            dispersion = look.dispersion / 100
+            if look.mode in (AURA, OIL):
+                hue = .49 + (hue - .49) * (.82 + .33 * dispersion)
+            light = self.color(hue, look)
+            if look.mode in (GLASS, POOL, PRISM):
+                # Small wavelength-dependent offsets are drawn from the same light field.
+                offset = max(0, min(13, round(min(self.width, self.height) * .011 * dispersion)))
+                if offset:
+                    r = np.pad(energy[:, :-offset], ((0, 0), (offset, 0)), mode="edge")
+                    b = np.pad(energy[:, offset:], ((0, 0), (0, offset)), mode="edge")
+                    emission = light * np.stack((r, energy, b), axis=-1)
+                    emission = cv2.addWeighted(emission, .55 + .40 * dispersion, light * energy[:, :, None],
+                                               .45 - .40 * dispersion, 0)
+                else:
+                    emission = light * energy[:, :, None]
             else:
                 emission = light * energy[:, :, None]
-        else:
-            emission = light * energy[:, :, None]
-        emission += white[:, :, None] * np.float32((.90, .95, 1.0))
+            emission += white[:, :, None] * np.float32((.90, .95, 1.0))
         if look.glow:
             image = self.glow(emission, look.glow / 100)
             emission = cv2.addWeighted(emission, 1, image, look.glow / 75, 0)
@@ -206,7 +281,12 @@ class Simulator:
             result = base + (1 - base) * emission
         result += self.noise[:, :, None]
         np.clip(result, 0, 1, out=result)
-        return cv2.convertScaleAbs(result, alpha=255)
+        frame = cv2.convertScaleAbs(result, alpha=255)
+        if look.textures.active:
+            if self.textures is None:
+                self.textures = TextureStack((self.width, self.height))
+            frame = self.textures.apply(frame, look.textures, position, look.seed, rgb(look.background)*255)
+        return frame
 
     def glow(self, emission, amount):
         width, height = max(2, self.width // 7), max(2, self.height // 7)
@@ -308,3 +388,60 @@ class Simulator:
         white = .21 * lace ** 2 * refraction
         ground = .47 + .48 * self.edge + .35 * (1 - np.minimum(first, 1)) * (.45 + .55 * refraction)
         return energy, hue, white, ground
+
+    def prism(self, t, p, scatter, density, dispersion):
+        x, y = self.x * density, self.y * density
+        a = self.x + .12 * math.sin(t + p[0])
+        b = self.y + .14 * math.cos(t + p[1])
+        energy = np.zeros_like(x + y)
+        hue = np.zeros_like(energy)
+        white = np.zeros_like(energy)
+        for i in range(3):
+            direction = .45 + i * 1.06 + .23 * math.sin(t + p[2+i])
+            cx, cy = math.cos(direction), math.sin(direction)
+            u = cx*x - cy*y + .2 * math.cos(t + p[5+i])
+            v = cy*x + cx*y + .25 * math.sin(t + p[8+i])
+            f = 1.28 * u + .64*np.abs(v) + (.08 + scatter*.30)*np.sin(v*6.1+u*3.3+p[11+i]+t)
+            g = v*1.36 - .38*np.abs(u) + .17*np.sin(u*4.2 + p[14+i] - t)
+            lattice = np.abs(np.sin(f * (4.8 + 1.9*scatter) + p[17+i]))
+            split = np.abs(np.sin(g * (3.8 + .54*i) + p[i]))
+            lens = np.exp(-((u - .12*i)*(.84 + i*.12))**2 - ((v + .16*i)*1.62)**2)
+            facets = np.clip((np.floor((f+.48*g)*3.6)+3.0) * .115, .10, .85)
+            colored_fan = np.exp(-lattice*(4.4 + (1-scatter)*3)) * (.38 + .62*split)
+            edge = np.exp(-(lattice + split*.26)*(17 - 6*scatter))
+            energy += (.49*colored_fan + .21*edge + .10*facets) * lens
+            hue += (.10 + .42*dispersion) * (f + .27*g) * lens
+            white += .16 * edge * lens
+        ground = .25 + .34 * self.edge + .18 * np.sin(7*a + 3*b + t + p[2])**2
+        return np.minimum(energy, 1.03), .49 + hue, np.minimum(white, .34), ground
+
+    def bokeh(self, t, look, scatter, density):
+        specs = bokeh_lights(look.seed)
+        count = min(len(specs), max(10, round(12 + density * 15 + scatter * 12)))
+        specs = specs[:count]
+        colors = self.color(np.float32(.49 + (specs[:, 4] - .5) * (.43 + .70 * look.dispersion / 100)), look)
+        emission = np.zeros((self.height, self.width, 3), np.float32)
+        for i, (sx, sy, depth, pulse, _, phase) in enumerate(specs):
+            orbit = (.007 + scatter*.060) * (1.0 + depth)
+            center_x = round((.5 + sx*(.82 + scatter*.36))*self.width +
+                             self.short*orbit*math.sin(t + 6.283*phase))
+            center_y = round((.5 + sy*(.77 + scatter*.43))*self.height +
+                             self.short*orbit*math.cos(t + 6.283*pulse))
+            size = (.018 + .129 * depth**2.5) * self.short / density**.35
+            radius = max(3, round(size * (1 + .075 * math.sin(t + 6.283*pulse))))
+            blur = min(4, int(depth * 5))
+            stamp = bokeh_stamp(radius, blur)
+            distance = (stamp.shape[0] - 1) // 2
+            left, top = center_x - distance, center_y - distance
+            x0, x1 = max(0, left), min(self.width, center_x + distance + 1)
+            y0, y1 = max(0, top), min(self.height, center_y + distance + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            optical = .07 + .35*(1-depth*.62) * (.75 + .25*math.sin(t + 6.283*phase))
+            color = colors[i] * optical
+            mask = stamp[y0-top:y1-top, x0-left:x1-left]
+            emission[y0:y1, x0:x1] += mask[:, :, None] * color
+        # A low, out-of-focus light behind the individual discs.
+        veil = .29 + .52*self.edge + .12*np.sin(self.x*4+self.y*2+t)**2
+        return emission, veil
+

@@ -1,25 +1,32 @@
 """Project Entropy desktop simulator."""
 
 from collections import deque
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields as state_fields, replace
 import json
 import math
 import os
+import sqlite3
 from pathlib import Path
 from queue import Empty, Queue
 from random import randrange
+import re
 import subprocess
 import sys
 from threading import Event, Thread
 from time import perf_counter
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 import traceback
 
 import cv2
 
 from entropy_diagnostics import DiagnosticsWindow, SessionLog, project_directory
-from entropy_engine import BLENDS, MODES, PALETTES, PRESETS, RATIOS, POOL, ExportSpec, Look, capped
+from entropy_engine import (
+    BLENDS, CUSTOM, MAX_EXPORT_SECONDS, MODES, PALETTES, POOL, PRESETS, RATIOS, ExportSpec, Look,
+    capped, decode_look, validate_colors,
+)
+from entropy_library import Library
+from entropy_studio import PalettesWindow, PresetsWindow, TexturesWindow
 from entropy_runtime import Cancelled, PreviewWorker, estimate, export_clip, load_preset, save_preset, seconds_label
 
 
@@ -45,16 +52,50 @@ FIELD_NAMES = {
 }
 
 
+def parse_duration(value):
+    if type(value) is int:
+        return value
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        return int(value)
+    match = re.fullmatch(r"([0-9]{1,2}):([0-5][0-9])", value)
+    if not match:
+        raise ValueError("Enter whole seconds or m:ss, such as 12:30.")
+    minutes, seconds = map(int, match.groups())
+    return minutes * 60 + seconds
+
+
+def duration_clock(seconds):
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+DURATION_CHOICES = tuple(duration_clock(value) for value in (
+    15, 30, 60, 120, 300, 600, 900, 1200, MAX_EXPORT_SECONDS,
+))
+
+
+def duration_field(seconds):
+    return duration_clock(seconds) if seconds >= 60 else str(seconds)
+
+
 def read_group(variables, last):
-    values = asdict(last)
+    values = {item.name: getattr(last, item.name) for item in state_fields(last)}
     issues = []
     for key, old_value in values.items():
+        if key not in variables or type(old_value) not in (str, int):
+            continue
         label = FIELD_NAMES.get(key, key.replace("_", " ").capitalize())
         try:
             raw = variables[key].get()
-            value = int(raw) if type(old_value) is int else raw
-        except (ValueError, TypeError, tk.TclError):
-            issues.append(f"{label} needs a whole number.")
+            if key == "seconds":
+                value = parse_duration(raw)
+            else:
+                value = int(raw) if type(old_value) is int else raw
+        except (ValueError, TypeError, AttributeError, tk.TclError):
+            message = ("needs whole seconds or m:ss, such as 12:30." if key == "seconds"
+                       else "needs a whole number.")
+            issues.append(f"{label} {message}")
             continue
         if value != old_value:
             try:
@@ -72,7 +113,7 @@ def resume_settings(args):
     if len(args) != 2 or args[0] != "--resume":
         raise ValueError("Unrecognized startup settings.")
     data = json.loads(args[1])
-    look = Look(**data["look"]).validate()
+    look = decode_look(data["look"])
     spec = ExportSpec(**data["export"]).validate()
     phase, looping, quality = float(data["phase"]), data["looping"], data["quality"]
     if not math.isfinite(phase) or not 0 <= phase <= 1 or type(looping) is not bool or quality not in PREVIEW_MODES:
@@ -86,7 +127,7 @@ class EntropyApp(tk.Tk):
         super().__init__()
         self.title("Project : Entropy")
         self.geometry("1210x795")
-        self.minsize(1010, 665)
+        self.minsize(1010, 705)
         self.configure(bg=BG)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.worker = PreviewWorker()
@@ -94,6 +135,8 @@ class EntropyApp(tk.Tk):
         self.preview_failed = False
         self.resume_after_failure = True
         self.diagnostics_window = None
+        self.library = Library(project_directory() / ".entropy-data")
+        self.tool_windows = {}
         self.events = Queue()
         self.cancel = Event()
         self.job = None
@@ -120,8 +163,14 @@ class EntropyApp(tk.Tk):
         self.render_rate = None
 
         self.look, self.export = look, spec
-        self.fields = {name: self.variable(value, editable=name == "seed") for name, value in asdict(look).items()}
-        self.output = {name: self.variable(value, editable=name == "seconds") for name, value in asdict(spec).items()}
+        self.fields = {
+            name: self.variable(value, editable=name == "seed")
+            for name, value in asdict(look).items() if name not in ("textures", "colors")
+        }
+        self.output = {
+            name: tk.StringVar(value=duration_field(value)) if name == "seconds" else self.variable(value)
+            for name, value in asdict(spec).items()
+        }
         self.preview_mode = tk.StringVar(value=quality)
         self.position_var = tk.DoubleVar(value=0)
         self.video_time = tk.StringVar(value="0.00 / 6 s")
@@ -188,10 +237,14 @@ class EntropyApp(tk.Tk):
         header = tk.Frame(self, bg=BG)
         header.grid(row=0, column=0, sticky="ew", padx=20, pady=(14, 12))
         self.label(header, "Project : Entropy", size=22, bold=True).pack(side="left")
-        ttk.Button(header, text="Save preset…", command=self.save).pack(side="right")
-        ttk.Button(header, text="Load preset…", command=self.load).pack(side="right", padx=8)
         self.issue_button = ttk.Button(header, textvariable=self.issue_text, command=self.open_diagnostics)
         self.issue_button.pack(side="right")
+        self.save_preset_button = ttk.Button(header, text="Save preset…", command=self.save_named_preset)
+        self.save_preset_button.pack(side="right", padx=(0, 7))
+        for label, tool in (("Presets", PresetsWindow), ("Palettes", PalettesWindow),
+                            ("Textures", TexturesWindow)):
+            ttk.Button(header, text=label, command=lambda cls=tool: self.open_tool(cls)).pack(
+                side="right", padx=(0, 7))
 
         content = tk.Frame(self, bg=BG)
         content.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 17))
@@ -224,7 +277,7 @@ class EntropyApp(tk.Tk):
         self.play_button.pack(side="left")
         self.timeline = ttk.Scale(playback, from_=0, to=1, variable=self.position_var, command=self.seek)
         self.timeline.pack(side="left", fill="x", expand=True, padx=10)
-        self.label(playback, variable=self.video_time, color=MUTED, width=15).pack(side="right")
+        self.label(playback, variable=self.video_time, color=MUTED, width=19).pack(side="right")
 
         meter = tk.Frame(studio, bg=BG)
         meter.grid(row=3, column=0, sticky="ew")
@@ -237,7 +290,12 @@ class EntropyApp(tk.Tk):
         side.grid(row=0, column=1, sticky="nsew")
         side.columnconfigure(0, weight=1)
         side.rowconfigure(2, weight=1)
-        self.label(side, "Effect", size=11, bold=True, bg=PANEL).grid(row=0, column=0, sticky="w", pady=(0, 5))
+        effect_header = tk.Frame(side, bg=PANEL)
+        effect_header.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        self.label(effect_header, "Effect", size=11, bold=True, bg=PANEL).pack(side="left")
+        self.reset_effect_button = ttk.Button(effect_header, text="Effect defaults",
+                                              command=self.reset_effect_controls)
+        self.reset_effect_button.pack(side="right")
         switches = tk.Frame(side, bg=PANEL)
         switches.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         for i, mode in enumerate(MODES):
@@ -274,11 +332,12 @@ class EntropyApp(tk.Tk):
         self.progress.pack(fill="x", pady=(8, 4))
         self.label(job, variable=self.job_status, color=MUTED, bg=PANEL, wraplength=294).pack(fill="x")
 
-    def choice(self, parent, label, variable, values):
+    def choice(self, parent, label, variable, values, *, editable=False):
         row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=2)
         self.label(row, label, bg=PANEL).pack(side="left")
-        menu = ttk.Combobox(row, textvariable=variable, state="readonly", values=values, width=15)
+        menu = ttk.Combobox(row, textvariable=variable, state="normal" if editable else "readonly",
+                            values=values, width=15)
         menu.pack(side="right")
         menu.bind("<<ComboboxSelected>>", self.schedule_controls)
         return menu
@@ -306,7 +365,7 @@ class EntropyApp(tk.Tk):
         return row
 
     def light_page(self, page):
-        self.choice(page, "Palette", self.fields["palette"], tuple(PALETTES))
+        self.palette_menu = self.choice(page, "Palette", self.fields["palette"], self.palette_choices(self.look))
         self.choice(page, "Blend", self.fields["blend"], BLENDS)
         for caption, key, low, high in (
                 ("Hue shift", "hue", -180, 180), ("Spectrum width", "spectrum", 1, 200),
@@ -334,7 +393,8 @@ class EntropyApp(tk.Tk):
         self.choice(page, "Aspect ratio", self.output["ratio"], tuple(RATIOS))
         self.choice(page, "Short edge", self.output["pixels"], (720, 1080, 1440))
         self.choice(page, "Frame rate", self.output["fps"], (24, 30, 60))
-        self.number(page, "Duration (seconds)", self.output["seconds"], 1, 30)
+        self.duration_menu = self.choice(page, "Duration (s or m:ss)", self.output["seconds"],
+                                         DURATION_CHOICES, editable=True)
         self.choice(page, "Render detail", self.output["quality"], ("Balanced", "Fine", "Native"))
         self.label(page, variable=self.resolution, color=ACCENT, bg=PANEL, wraplength=290).pack(fill="x", pady=7)
         self.estimate_button = ttk.Button(page, text="Estimate render time", command=self.start_estimate)
@@ -351,23 +411,67 @@ class EntropyApp(tk.Tk):
         self.fields["seed"].set(randrange(1000000))
         self.read_controls()
 
+    def open_tool(self, tool):
+        window = self.tool_windows.get(tool)
+        if window is None or not window.winfo_exists():
+            self.tool_windows[tool] = tool(self)
+        else:
+            if hasattr(window, "refresh"):
+                window.refresh()
+            window.deiconify()
+            window.lift()
+
+    @staticmethod
+    def palette_choices(look):
+        return (*PALETTES, CUSTOM) if look.colors else tuple(PALETTES)
+
     def pick_mode(self):
-        self.apply_look(PRESETS[self.fields["mode"].get()])
+        self.capture_settings()
+
+    def reset_effect_controls(self):
+        self.capture_settings()
+        defaults = PRESETS[self.look.mode]
+        self.apply_look(replace(defaults, textures=self.look.textures, colors=self.look.colors))
 
     def apply_look(self, look):
-        for name, value in asdict(look).items():
-            self.fields[name].set(value)
-        self.read_controls()
+        for name, control in self.fields.items():
+            control.set(getattr(look, name))
+        window = self.tool_windows.get(TexturesWindow)
+        if window is not None and window.winfo_exists():
+            window.sync(look.textures)
+        self.read_controls(look)
+
+    def apply_palette(self, colors):
+        colors = validate_colors(colors)
+        self.fields["palette"].set(CUSTOM)
+        self.read_controls(replace(self.look, palette=CUSTOM, colors=colors))
+
+    def apply_textures(self, texture):
+        self.read_controls(replace(self.look, textures=texture))
+
+    def apply_preset(self, look, spec):
+        for name, value in asdict(spec).items():
+            self.output[name].set(duration_field(value) if name == "seconds" else value)
+        self.apply_look(look)
+
+    def flush_textures(self):
+        window = self.tool_windows.get(TexturesWindow)
+        if window is not None and window.winfo_exists():
+            window.flush()
+
+    def capture_settings(self):
+        self.flush_textures()
+        return self.read_controls()
 
     def schedule_controls(self, *_event):
         if self.configure_job is None:
             self.configure_job = self.after(32, self.read_controls)
 
-    def read_controls(self):
+    def read_controls(self, look_base=None):
         if self.configure_job is not None:
             self.after_cancel(self.configure_job)
             self.configure_job = None
-        look, look_issues = read_group(self.fields, self.look)
+        look, look_issues = read_group(self.fields, look_base or self.look)
         spec, export_issues = read_group(self.output, self.export)
         for group, issues in (("Look settings", look_issues), ("Export settings", export_issues)):
             if issues:
@@ -394,6 +498,7 @@ class EntropyApp(tk.Tk):
             if self.job is None:
                 self.estimate_text.set("Estimate samples the current render settings.")
         self.name.set(look.mode)
+        self.palette_menu.configure(values=self.palette_choices(look))
         self.color_chip.configure(bg=look.background)
         self.update_output_label()
         return not issues
@@ -476,7 +581,12 @@ class EntropyApp(tk.Tk):
             self.accept_preview(reply, now)
         phase = self.phase(now)
         self.position_var.set(phase)
-        self.video_time.set(f"{phase * self.export.seconds:.2f} / {self.export.seconds} s")
+        duration = self.export.seconds
+        elapsed = phase * duration
+        if duration < 60:
+            self.video_time.set(f"{elapsed:.2f} / {duration} s")
+        else:
+            self.video_time.set(f"{duration_clock(int(elapsed))} / {duration_clock(duration)}")
         visible = self.state() not in ("iconic", "withdrawn")
         if self.preview_failed:
             return
@@ -567,8 +677,30 @@ class EntropyApp(tk.Tk):
             self.canvas.coords(self.canvas_image, canvas_w/2, canvas_h/2)
             self.canvas.itemconfigure(self.canvas_image, image=self.photo)
 
+    def save_named_preset(self, parent=None, feedback=None):
+        notify = feedback or self.job_status.set
+        if not self.capture_settings():
+            notify("Correct the highlighted setting before saving a preset.")
+            return
+        look, spec = self.look, self.export
+        name = simpledialog.askstring("Save preset", "Name", initialvalue=look.mode,
+                                      parent=parent or self)
+        if name is None:
+            return
+        try:
+            saved = self.library.save_preset(name, look, spec)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.issue("Library", str(error), traceback.format_exc())
+            notify(str(error))
+        else:
+            self.clear_issue("Library")
+            window = self.tool_windows.get(PresetsWindow)
+            if window is not None and window.winfo_exists():
+                window.refresh(saved)
+            notify(f"Saved {saved}.")
+
     def save(self):
-        if not self.read_controls():
+        if not self.capture_settings():
             self.job_status.set("Correct the highlighted setting before saving a preset.")
             return
         name = filedialog.asksaveasfilename(parent=self, title="Save Entropy preset",
@@ -594,15 +726,13 @@ class EntropyApp(tk.Tk):
                 self.job_status.set(f"Preset could not be loaded: {error}")
             else:
                 self.clear_issue("Preset")
-                for key, value in asdict(spec).items():
-                    self.output[key].set(value)
-                self.apply_look(look)
+                self.apply_preset(look, spec)
                 self.job_status.set(f"Loaded preset {Path(name).name}")
 
     def start_estimate(self):
         if self.job is not None:
             return
-        if not self.read_controls():
+        if not self.capture_settings():
             self.estimate_text.set("Correct the highlighted setting before estimating.")
             return
         self.job = "estimate"
@@ -624,7 +754,7 @@ class EntropyApp(tk.Tk):
     def start_export(self):
         if self.job is not None:
             return
-        if not self.read_controls():
+        if not self.capture_settings():
             self.job_status.set("Correct the highlighted setting before exporting.")
             return
         filename = filedialog.asksaveasfilename(
@@ -815,7 +945,7 @@ class EntropyApp(tk.Tk):
         if self.job == "export":
             self.job_status.set("Finish or cancel the export before restarting the app.")
             return
-        self.read_controls()
+        self.capture_settings()
         state = json.dumps({"look": asdict(self.look), "export": asdict(self.export),
                             "phase": self.phase(perf_counter()),
                             "looping": self.resume_after_failure if self.preview_failed else self.looping,

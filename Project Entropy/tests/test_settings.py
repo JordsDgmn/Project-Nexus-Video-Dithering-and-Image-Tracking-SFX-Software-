@@ -2,7 +2,7 @@ from dataclasses import asdict
 import json
 import unittest
 
-from entropy_app import read_group, resume_settings
+from entropy_app import DURATION_CHOICES, parse_duration, read_group, resume_settings
 from entropy_engine import ExportSpec, Look
 
 
@@ -29,7 +29,25 @@ class SettingsTests(unittest.TestCase):
         base = ExportSpec()
         latest, issues = read_group(form(base, seconds="", ratio="9:16"), base)
         self.assertEqual((latest.seconds, latest.size), (base.seconds, (1080, 1920)))
-        self.assertEqual(issues, ["Duration (Export) needs a whole number."])
+        self.assertEqual(issues, ["Duration (Export) needs whole seconds or m:ss, such as 12:30."])
+
+    def test_export_duration_accepts_seconds_and_minute_presets(self):
+        self.assertEqual(parse_duration("12:30"), 750)
+        self.assertEqual(parse_duration(" 90 "), 90)
+        self.assertEqual(DURATION_CHOICES[-1], "30:00")
+        spec, issues = read_group(form(ExportSpec(), seconds="30:00", fps=60), ExportSpec())
+        self.assertEqual(spec.frames, 108000)
+        self.assertFalse(issues)
+
+    def test_overlong_or_malformed_duration_keeps_last_good_value(self):
+        spec = ExportSpec(seconds=750)
+        for invalid in ("30:01", "1801", "1:60", "12.5", "00:00"):
+            with self.subTest(invalid=invalid):
+                result, issues = read_group(form(spec, seconds=invalid), spec)
+                self.assertEqual(result, spec)
+                self.assertTrue(issues)
+        self.assertIs(ExportSpec(seconds=1800).validate().frames > 0, True)
+
 
     def test_bad_field_does_not_discard_the_rest_of_the_form(self):
         base = Look()
