@@ -1,0 +1,6 @@
+.entropy-build/
+dist/
+examples/
+.venv/
+__pycache__/
+*.py[cod]
