@@ -8,6 +8,7 @@ from queue import Empty, Full, Queue
 import tempfile
 from threading import Condition, Thread
 from time import perf_counter
+import traceback
 
 import cv2
 
@@ -35,7 +36,8 @@ class PreviewWorker:
         self.pending = None
         self.closed = False
         self.results = Queue(maxsize=1)
-        Thread(target=self.run, daemon=True, name="Entropy preview").start()
+        self.thread = Thread(target=self.run, daemon=True, name="Entropy preview")
+        self.thread.start()
 
     def request(self, ticket, size, phase, look):
         with self.changed:
@@ -66,7 +68,8 @@ class PreviewWorker:
                 frame = simulator.frame(phase, look)
                 result = (ticket, size, frame, perf_counter() - now, None)
             except Exception as error:
-                result = (ticket, size, None, perf_counter() - now, str(error))
+                result = (ticket, size, None, perf_counter() - now,
+                          (str(error) or type(error).__name__, traceback.format_exc()))
             try:
                 self.results.put_nowait(result)
             except Full:

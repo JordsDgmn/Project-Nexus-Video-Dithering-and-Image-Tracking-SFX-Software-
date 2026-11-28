@@ -1,18 +1,24 @@
 """Project Entropy desktop simulator."""
 
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import json
 import math
+import os
 from pathlib import Path
 from queue import Empty, Queue
 from random import randrange
+import subprocess
+import sys
 from threading import Event, Thread
 from time import perf_counter
 import tkinter as tk
-from tkinter import colorchooser, filedialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
+import traceback
 
 import cv2
 
+from entropy_diagnostics import DiagnosticsWindow, SessionLog, project_directory
 from entropy_engine import BLENDS, MODES, PALETTES, PRESETS, RATIOS, POOL, ExportSpec, Look, capped
 from entropy_runtime import Cancelled, PreviewWorker, estimate, export_clip, load_preset, save_preset, seconds_label
 
@@ -28,8 +34,55 @@ AMBER = "#f6c48d"
 BORDER = "#30303e"
 
 
+PREVIEW_MODES = ("Auto", "Eco", "Sharp")
+PREVIEW_TIMEOUT = 4
+FIELD_NAMES = {
+    "seed": "Seed (Motion)",
+    "seconds": "Duration (Export)",
+    "fps": "Frame rate (Export)",
+    "pixels": "Short edge (Export)",
+    "ratio": "Aspect ratio (Export)",
+}
+
+
+def read_group(variables, last):
+    values = asdict(last)
+    issues = []
+    for key, old_value in values.items():
+        label = FIELD_NAMES.get(key, key.replace("_", " ").capitalize())
+        try:
+            raw = variables[key].get()
+            value = int(raw) if type(old_value) is int else raw
+        except (ValueError, TypeError, tk.TclError):
+            issues.append(f"{label} needs a whole number.")
+            continue
+        if value != old_value:
+            try:
+                replace(last, **{key: value}).validate()
+            except ValueError as error:
+                issues.append(f"{label}: {error}")
+                continue
+            values[key] = value
+    return type(last)(**values), issues
+
+
+def resume_settings(args):
+    if not args:
+        return None
+    if len(args) != 2 or args[0] != "--resume":
+        raise ValueError("Unrecognized startup settings.")
+    data = json.loads(args[1])
+    look = Look(**data["look"]).validate()
+    spec = ExportSpec(**data["export"]).validate()
+    phase, looping, quality = float(data["phase"]), data["looping"], data["quality"]
+    if not math.isfinite(phase) or not 0 <= phase <= 1 or type(looping) is not bool or quality not in PREVIEW_MODES:
+        raise ValueError("Invalid saved preview state.")
+    return look, spec, phase, looping, quality
+
+
 class EntropyApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, diagnostics=None, resumed=None):
+        self.diagnostics = diagnostics or SessionLog()
         super().__init__()
         self.title("Project : Entropy")
         self.geometry("1210x795")
@@ -37,15 +90,20 @@ class EntropyApp(tk.Tk):
         self.configure(bg=BG)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.worker = PreviewWorker()
+        self.retired_worker = None
+        self.preview_failed = False
+        self.resume_after_failure = True
+        self.diagnostics_window = None
         self.events = Queue()
         self.cancel = Event()
         self.job = None
         self.result = None
         self.photo = self.canvas_image = None
-        self.looping = True
+        look, spec, phase, looping, quality = resumed or (Look(), ExportSpec(), 0., True, "Auto")
+        self.looping = looping
         self.exiting = False
         self.anchor_time = perf_counter()
-        self.anchor_phase = self.position = 0.
+        self.anchor_phase = phase
         self.last_due = self.anchor_time
         self.current_ticket = self.revision = 0
         self.pending = None
@@ -54,34 +112,40 @@ class EntropyApp(tk.Tk):
         self.configure_job = None
         self.frame_times = deque(maxlen=24)
         self.frame_latency = None
-        self.preview_edge = 640
+        self.preview_edge = 440 if look.mode == POOL else 640
         self.good_streak = 0
         self.skipped = 0
         self.presented = 0
         self.last_sample = None
         self.render_rate = None
 
-        self.look = Look()
-        self.export = ExportSpec()
-        self.fields = {name: self.variable(value) for name, value in asdict(self.look).items()}
-        self.output = {name: self.variable(value) for name, value in asdict(self.export).items()}
-        self.preview_mode = tk.StringVar(value="Auto")
+        self.look, self.export = look, spec
+        self.fields = {name: self.variable(value, editable=name == "seed") for name, value in asdict(look).items()}
+        self.output = {name: self.variable(value, editable=name == "seconds") for name, value in asdict(spec).items()}
+        self.preview_mode = tk.StringVar(value=quality)
         self.position_var = tk.DoubleVar(value=0)
         self.video_time = tk.StringVar(value="0.00 / 6 s")
         self.preview_status = tk.StringVar(value="Starting preview…")
         self.preview_info = tk.StringVar(value="—")
         self.resolution = tk.StringVar()
         self.job_status = tk.StringVar(value="Ready to export")
+        self.form_status = tk.StringVar()
+        self.issue_text = tk.StringVar(value="Diagnostics")
         self.estimate_text = tk.StringVar(value="Estimate samples the current render settings.")
         self.name = tk.StringVar(value=self.look.mode)
 
         self.setup_styles()
         self.build()
+        for variable in (*self.fields.values(), *self.output.values()):
+            variable.trace_add("write", self.schedule_controls)
+        self.update_issues()
         self.update_output_label()
+        if resumed:
+            self.diagnostics.record("Restored the last valid look, export settings, and preview position.")
         self.after(12, self.tick)
 
-    def variable(self, value):
-        kind = tk.IntVar if type(value) is int else tk.StringVar
+    def variable(self, value, editable=False):
+        kind = tk.IntVar if type(value) is int and not editable else tk.StringVar
         return kind(value=value)
 
     def setup_styles(self):
@@ -92,6 +156,7 @@ class EntropyApp(tk.Tk):
                         lightcolor=BORDER, darkcolor=BORDER)
         style.map("TButton", background=[("active", "#403750"), ("disabled", "#282631")],
                   foreground=[("disabled", "#777283")])
+        style.configure("Issue.TButton", foreground=AMBER, background="#47353a")
         style.configure("Export.TButton", font=("Segoe UI", 10, "bold"), background=ACCENT,
                         foreground="#1d1330", padding=(14, 8))
         style.map("Export.TButton", background=[("active", "#dbc8ff"), ("disabled", "#383246")],
@@ -125,6 +190,8 @@ class EntropyApp(tk.Tk):
         self.label(header, "Project : Entropy", size=22, bold=True).pack(side="left")
         ttk.Button(header, text="Save preset…", command=self.save).pack(side="right")
         ttk.Button(header, text="Load preset…", command=self.load).pack(side="right", padx=8)
+        self.issue_button = ttk.Button(header, textvariable=self.issue_text, command=self.open_diagnostics)
+        self.issue_button.pack(side="right")
 
         content = tk.Frame(self, bg=BG)
         content.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 17))
@@ -152,7 +219,8 @@ class EntropyApp(tk.Tk):
 
         playback = tk.Frame(studio, bg=BG)
         playback.grid(row=2, column=0, sticky="ew", pady=(8, 7))
-        self.play_button = ttk.Button(playback, text="Pause", width=8, command=self.toggle_play)
+        self.play_button = ttk.Button(playback, text="Pause" if self.looping else "Play",
+                                      width=8, command=self.toggle_play)
         self.play_button.pack(side="left")
         self.timeline = ttk.Scale(playback, from_=0, to=1, variable=self.position_var, command=self.seek)
         self.timeline.pack(side="left", fill="x", expand=True, padx=10)
@@ -162,6 +230,7 @@ class EntropyApp(tk.Tk):
         meter.grid(row=3, column=0, sticky="ew")
         self.state_label = self.label(meter, variable=self.preview_status, color=GREEN, bold=True)
         self.state_label.pack(side="left")
+        self.restart_button = ttk.Button(meter, text="Restart preview", command=self.restart_preview)
         self.label(meter, variable=self.preview_info, color=MUTED).pack(side="right")
 
         side = tk.Frame(content, bg=PANEL, padx=12, pady=11, highlightbackground=BORDER, highlightthickness=1)
@@ -187,8 +256,12 @@ class EntropyApp(tk.Tk):
             tabs.add(page, text=name)
             build(page)
 
+        self.validation_label = self.label(side, variable=self.form_status, color=AMBER,
+                                           bg=PANEL, wraplength=292)
+        self.validation_label.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        self.validation_label.grid_remove()
         job = tk.Frame(side, bg=PANEL)
-        job.grid(row=3, column=0, sticky="ew", pady=(9, 0))
+        job.grid(row=4, column=0, sticky="ew", pady=(9, 0))
         actions = tk.Frame(job, bg=PANEL)
         actions.pack(fill="x")
         self.export_button = ttk.Button(actions, text="Export MP4", command=self.start_export, style="Export.TButton")
@@ -286,7 +359,7 @@ class EntropyApp(tk.Tk):
             self.fields[name].set(value)
         self.read_controls()
 
-    def schedule_controls(self, _event=None):
+    def schedule_controls(self, *_event):
         if self.configure_job is None:
             self.configure_job = self.after(32, self.read_controls)
 
@@ -294,12 +367,20 @@ class EntropyApp(tk.Tk):
         if self.configure_job is not None:
             self.after_cancel(self.configure_job)
             self.configure_job = None
-        try:
-            look = Look(**{key: value.get() for key, value in self.fields.items()}).validate()
-            spec = ExportSpec(**{key: value.get() for key, value in self.output.items()}).validate()
-        except (ValueError, tk.TclError) as error:
-            self.job_status.set(str(error))
-            return False
+        look, look_issues = read_group(self.fields, self.look)
+        spec, export_issues = read_group(self.output, self.export)
+        for group, issues in (("Look settings", look_issues), ("Export settings", export_issues)):
+            if issues:
+                self.issue(group, " ".join(issues))
+            else:
+                self.clear_issue(group)
+        issues = look_issues + export_issues
+        if issues:
+            self.form_status.set(issues[0] + " Preview is using the last valid value.")
+            self.validation_label.grid()
+        else:
+            self.form_status.set("")
+            self.validation_label.grid_remove()
         if (look, spec) != (self.look, self.export):
             self.anchor_phase = self.phase(perf_counter())
             self.anchor_time = perf_counter()
@@ -315,7 +396,7 @@ class EntropyApp(tk.Tk):
         self.name.set(look.mode)
         self.color_chip.configure(bg=look.background)
         self.update_output_label()
-        return True
+        return not issues
 
     def update_output_label(self):
         width, height = self.export.size
@@ -337,6 +418,9 @@ class EntropyApp(tk.Tk):
         return (self.anchor_phase + (now - self.anchor_time) / self.export.seconds) % 1
 
     def toggle_play(self):
+        if self.preview_failed:
+            self.restart_preview()
+            return
         now = perf_counter()
         self.anchor_phase = self.phase(now)
         self.anchor_time = now
@@ -373,6 +457,15 @@ class EntropyApp(tk.Tk):
     def tick(self):
         if self.exiting:
             return
+        try:
+            self.tick_once()
+        except Exception as error:
+            self.fail_preview(str(error) or type(error).__name__, traceback.format_exc())
+        finally:
+            if not self.exiting:
+                self.after(9 if self.looping else 22, self.tick)
+
+    def tick_once(self):
         self.handle_events()
         now = perf_counter()
         try:
@@ -385,6 +478,12 @@ class EntropyApp(tk.Tk):
         self.position_var.set(phase)
         self.video_time.set(f"{phase * self.export.seconds:.2f} / {self.export.seconds} s")
         visible = self.state() not in ("iconic", "withdrawn")
+        if self.preview_failed:
+            return
+        if self.pending is not None and (not self.worker.thread.is_alive()
+                                         or now - self.pending[2] > PREVIEW_TIMEOUT):
+            self.fail_preview("The preview stopped responding.")
+            return
         if visible and self.pending is None and (self.dirty or self.looping and now >= self.last_due):
             self.current_ticket += 1
             size = self.preview_size()
@@ -395,14 +494,13 @@ class EntropyApp(tk.Tk):
                 self.skipped += missed
                 self.last_due += (missed + 1) / 30
             self.worker.request(self.current_ticket, size, phase, self.look)
-            self.pending = (self.current_ticket, self.revision, now)
+            self.pending = (self.current_ticket, self.revision, now, self.look)
             self.dirty = False
         elif visible and self.pending is not None and now - self.pending[2] > .16:
             self.preview_status.set("Buffering preview")
             self.state_label.configure(fg=AMBER)
         if not visible:
             self.last_due = now
-        self.after(9 if self.looping else 22, self.tick)
 
     def accept_preview(self, reply, now):
         ticket, size, frame, latency, error = reply
@@ -410,17 +508,19 @@ class EntropyApp(tk.Tk):
         if pending is None or ticket != pending[0]:
             return
         self.pending = None
-        if pending[1] != self.revision:
-            return
+        outdated = pending[1] != self.revision
         if error:
-            self.preview_status.set(f"Preview error: {error}")
-            self.state_label.configure(fg=AMBER)
-            self.looping = self.dirty = False
-            self.play_button.configure(text="Play")
+            if not outdated:
+                self.fail_preview(*error)
             return
         self.draw(frame)
-        self.applied = self.look
+        self.applied = pending[3]
         self.presented += 1
+        self.clear_issue("Preview")
+        if outdated:
+            self.preview_status.set("Updating preview…")
+            self.state_label.configure(fg=AMBER)
+            return
         if self.looping:
             self.frame_times.append(now)
         self.frame_latency = latency if self.frame_latency is None else .22 * latency + .78 * self.frame_latency
@@ -469,6 +569,7 @@ class EntropyApp(tk.Tk):
 
     def save(self):
         if not self.read_controls():
+            self.job_status.set("Correct the highlighted setting before saving a preset.")
             return
         name = filedialog.asksaveasfilename(parent=self, title="Save Entropy preset",
                                            defaultextension=".json", filetypes=[("Entropy preset", "*.json")])
@@ -476,8 +577,10 @@ class EntropyApp(tk.Tk):
             try:
                 save_preset(Path(name), self.look, self.export)
             except (OSError, ValueError) as error:
+                self.issue("Preset", "Could not save the preset.", traceback.format_exc())
                 self.job_status.set(f"Preset could not be saved: {error}")
             else:
+                self.clear_issue("Preset")
                 self.job_status.set(f"Saved preset {Path(name).name}")
 
     def load(self):
@@ -487,15 +590,20 @@ class EntropyApp(tk.Tk):
             try:
                 look, spec = load_preset(Path(name))
             except (OSError, ValueError) as error:
+                self.issue("Preset", "Could not load the preset.", traceback.format_exc())
                 self.job_status.set(f"Preset could not be loaded: {error}")
             else:
+                self.clear_issue("Preset")
                 for key, value in asdict(spec).items():
                     self.output[key].set(value)
                 self.apply_look(look)
                 self.job_status.set(f"Loaded preset {Path(name).name}")
 
     def start_estimate(self):
-        if self.job is not None or not self.read_controls():
+        if self.job is not None:
+            return
+        if not self.read_controls():
+            self.estimate_text.set("Correct the highlighted setting before estimating.")
             return
         self.job = "estimate"
         self.estimate_text.set("Sampling three frames…")
@@ -507,14 +615,17 @@ class EntropyApp(tk.Tk):
             try:
                 result = estimate(look, spec)
             except Exception as error:
-                self.events.put(("estimate-error", str(error)))
+                self.events.put(("estimate-error", (str(error) or type(error).__name__, traceback.format_exc())))
             else:
                 self.events.put(("estimate", (look, spec, *result)))
 
         Thread(target=run, daemon=True, name="Entropy estimate").start()
 
     def start_export(self):
-        if self.job is not None or not self.read_controls():
+        if self.job is not None:
+            return
+        if not self.read_controls():
+            self.job_status.set("Correct the highlighted setting before exporting.")
             return
         filename = filedialog.asksaveasfilename(
             parent=self, title="Save Entropy video", initialfile=f"Entropy-{self.look.mode.replace(' ', '-')}.mp4",
@@ -524,6 +635,7 @@ class EntropyApp(tk.Tk):
             return
         path = Path(filename)
         if path.exists() or path.is_symlink():
+            self.issue("Export", "An existing output prevented the export.")
             self.job_status.set("That file exists. Choose a new name.")
             return
         self.job = "export"
@@ -549,7 +661,7 @@ class EntropyApp(tk.Tk):
             except Cancelled:
                 self.events.put(("cancelled", None))
             except Exception as error:
-                self.events.put(("error", str(error)))
+                self.events.put(("error", (str(error) or type(error).__name__, traceback.format_exc())))
             else:
                 self.events.put(("done", (path, elapsed, spec)))
 
@@ -571,13 +683,16 @@ class EntropyApp(tk.Tk):
                 self.estimate_button.configure(state="normal")
                 self.export_button.configure(state="normal")
                 if kind == "estimate":
+                    self.clear_issue("Estimate")
                     look, spec, elapsed, rate = value
                     if (look, spec) == (self.look, self.export):
                         self.estimate_text.set(f"About {seconds_label(elapsed)} before encoding · {rate:.1f} fps")
                     else:
                         self.estimate_text.set("Settings changed. Estimate again for this look.")
                 else:
-                    self.estimate_text.set(f"Estimate unavailable: {value}")
+                    message, detail = value
+                    self.issue("Estimate", message, detail)
+                    self.estimate_text.set(f"Estimate unavailable: {message}")
             else:
                 self.finish_export(kind, value)
 
@@ -604,13 +719,16 @@ class EntropyApp(tk.Tk):
         self.estimate_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         if kind == "done":
+            self.clear_issue("Export")
             path, elapsed, spec = value
             self.result = path
             self.job_status.set(f"Saved {path.name}\n{seconds_label(elapsed)} · {spec.frames / elapsed:.1f} fps")
         elif kind == "cancelled":
             self.job_status.set("Cancelled. No output was saved.")
         else:
-            self.job_status.set(f"Export failed: {value}")
+            message, detail = value
+            self.issue("Export", message, detail)
+            self.job_status.set(f"Export failed: {message}")
         self.dirty = True
         self.result_button.configure(state="normal" if self.result is not None else "disabled")
 
@@ -620,12 +738,100 @@ class EntropyApp(tk.Tk):
         self.job_status.set("Cancelling export…")
 
     def open_result(self):
-        import os
         if self.result:
             try:
                 os.startfile(self.result)
             except OSError as error:
+                self.issue("Playback", "Could not open the exported video.", traceback.format_exc())
                 self.job_status.set(f"Could not open the export: {error}")
+            else:
+                self.clear_issue("Playback")
+
+    def update_issues(self):
+        count = len(self.diagnostics.active)
+        title = "Diagnostics" if not count else f"{count} issue" + ("s" if count != 1 else "")
+        self.issue_text.set(title)
+        self.issue_button.configure(style="Issue.TButton" if count else "TButton")
+
+    def issue(self, area, message, detail=None):
+        self.diagnostics.issue(area, message, detail)
+        self.update_issues()
+
+    def clear_issue(self, area):
+        if area in self.diagnostics.active:
+            self.diagnostics.clear(area)
+            self.update_issues()
+
+    def report_callback_exception(self, error_type, error, stack):
+        self.issue("Interface", str(error) or error_type.__name__,
+                   "".join(traceback.format_exception(error_type, error, stack)))
+
+    def open_diagnostics(self):
+        if self.diagnostics_window is None:
+            self.diagnostics_window = DiagnosticsWindow(self)
+        else:
+            self.diagnostics_window.deiconify()
+            self.diagnostics_window.lift()
+
+    def fail_preview(self, message, detail=None):
+        if not self.preview_failed:
+            self.resume_after_failure = self.looping
+        self.anchor_phase = self.phase(perf_counter())
+        self.looping = self.dirty = False
+        self.preview_failed = True
+        self.pending = None
+        self.issue("Preview", message, detail)
+        self.preview_status.set("Preview stopped")
+        self.state_label.configure(fg=AMBER)
+        self.play_button.configure(text="Restart")
+        self.restart_button.pack(side="left", padx=8)
+
+    def restart_preview(self):
+        if self.retired_worker is not None and self.retired_worker.thread.is_alive():
+            self.issue("Preview", "An earlier preview is still finishing. Restart the app if it remains stuck.")
+            return
+        self.read_controls()
+        now = perf_counter()
+        self.anchor_phase = self.phase(now)
+        self.anchor_time = self.last_due = now
+        self.looping = self.resume_after_failure if self.preview_failed else self.looping
+        self.worker.close()
+        self.retired_worker = self.worker
+        self.worker = PreviewWorker()
+        self.revision += 1
+        self.pending = None
+        self.preview_failed = False
+        self.dirty = True
+        self.frame_times.clear()
+        self.frame_latency = None
+        self.good_streak = self.skipped = 0
+        self.preview_edge = 440 if self.look.mode == POOL else 560
+        self.preview_status.set("Restarting preview…")
+        self.play_button.configure(text="Pause" if self.looping else "Play")
+        self.restart_button.pack_forget()
+        self.diagnostics.record("Preview restarted with the last valid settings.")
+
+    def restart_app(self):
+        if self.job == "export":
+            self.job_status.set("Finish or cancel the export before restarting the app.")
+            return
+        self.read_controls()
+        state = json.dumps({"look": asdict(self.look), "export": asdict(self.export),
+                            "phase": self.phase(perf_counter()),
+                            "looping": self.resume_after_failure if self.preview_failed else self.looping,
+                            "quality": self.preview_mode.get()})
+        executable = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            executable.append(str(Path(__file__).resolve()))
+        try:
+            subprocess.Popen([*executable, "--resume", state], cwd=project_directory(),
+                             env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as error:
+            self.issue("Restart", str(error), traceback.format_exc())
+        else:
+            self.diagnostics.record("App restart requested with the last valid settings.")
+            self.close()
 
     def close(self):
         if self.job == "export":
@@ -633,8 +839,28 @@ class EntropyApp(tk.Tk):
             return
         self.exiting = True
         self.worker.close()
+        if self.diagnostics_window is not None:
+            self.diagnostics_window.close()
+        self.diagnostics.close()
         self.destroy()
 
 
+def main():
+    diagnostics = SessionLog()
+    try:
+        try:
+            resumed = resume_settings(sys.argv[1:])
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            diagnostics.issue("Restore", str(error), traceback.format_exc())
+            resumed = None
+        EntropyApp(diagnostics, resumed).mainloop()
+    except Exception as error:
+        diagnostics.issue("Startup", str(error) or type(error).__name__, traceback.format_exc())
+        messagebox.showerror("Entropy could not start",
+                             f"{error}\n\nSession log: {diagnostics.path or 'Unavailable'}")
+    finally:
+        diagnostics.close()
+
+
 if __name__ == "__main__":
-    EntropyApp().mainloop()
+    main()

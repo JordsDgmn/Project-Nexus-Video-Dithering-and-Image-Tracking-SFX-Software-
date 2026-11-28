@@ -4,7 +4,7 @@ A local Windows backdrop simulator. Choose an effect, shape the light and motion
 
 ## Use Entropy
 
-1. Open `dist/Project Entropy.exe`.
+1. Open `dist/Project Entropy Recovery.exe`.
 2. Choose **Prismatic aura**, **Iridescent oil**, **Glass caustics**, or **Pool reflections**. The simulation starts immediately.
 3. Use **Light** for palette, hue, spectrum width, saturation, dispersion, glow, intensity, background, and blend. Use **Motion** for scatteredness, compactness, cycles, and the repeatable seed. Scrub the timeline to inspect a still, then press **Play**.
 4. Under **Export**, set the aspect, resolution, frame rate, duration, and render detail. **Estimate render time** samples the current settings before encoding. While exporting, the app measures throughput and updates its remaining-time estimate.
@@ -27,3 +27,13 @@ Use Python 3.12 or later on Windows with Tk available. Install `requirements.txt
 - `references/stash-oil-reference.txt` is the original TSX excerpt supplied for visual reference. The Entropy engine is written separately in Python.
 
 References used for the material and light behavior. [Stash Effects](https://stash.style/effects) · [WaterCaustics Python experiments](https://github.com/pabennett/WaterCaustics) · [Rendering Water Caustics](https://developer.nvidia.com/gpugems/gpugems/part-i-natural-effects/chapter-2-rendering-water-caustics)
+
+## Diagnostics and recovery
+
+The **Diagnostics** button stays compact when the app is healthy and shows the active issue count when a problem occurs. Open it for the current issue and recent session events. **Open log folder** opens the local `.entropy-data/logs` directory, including previous sessions.
+
+If Seed or Duration is temporarily empty or invalid, Entropy keeps its last valid value for preview and continues applying other controls. Correct the highlighted field before exporting, estimating, or saving a preset.
+
+**Restart preview** starts a fresh renderer while keeping the look and timeline. **Restart app** reopens Entropy using the last valid settings, preview quality, and timeline position. Complete or cancel an export before restarting the app.
+
+Run the focused settings checks with `python -m unittest discover -s tests`.
