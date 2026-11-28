@@ -8,6 +8,12 @@ Project Nexus is a Windows desktop app for image and object tracking in local vi
 - `nexus_app.py` and the packaged Windows executable provide drag-and-drop loading and MP4 export for whole-frame dither. The separate Project Nexus Tracking executable uses the shared CSRT core. It opens a video, accepts one on-screen box, exports a tracking-box or tracked-dither MP4 with CSV, and plays the result in the desktop window. Both modes passed the synthetic translation test. Real-footage and laptop performance verification remain pending.
 - The release order below reflects current project priorities. TASKS.md and HANDOFF.md hold ownership and handoff records. Their initial implementation status predates the CLI and desktop build.
 
+### Live Studio build
+
+Open `.nexus-runtime/release/Project Nexus Live Studio.exe` and use **Save preset…** or **Load preset…** below the preview. The preset folder starts with **softdots-bright-halftone**, using all four Soft Dots tabs from the supplied screenshots. Presets store the look, style settings, tracking mode, output size, and preview quality. The source video, timeline position, and per-clip tracking selection are picked for each job. Image overlay presets reference the image file.
+
+Nexus offers to save changes before replacing an edited style. **Cancel** keeps the current look and settings. Soft Dots and tracking controls refresh the current frame and also work during **Play preview**. **Preview quality** offers Auto, Performance, Balanced, and High. Auto adapts the working resolution during playback. The size under **Advanced → Presets & export** controls the exported video separately.
+
 ### Tracking Lab build
 
 Open `Project Nexus Tracking Lab.exe` for **Clean blobs**, **Line network**, **Motion vectors**, **Word scatter**, and **ASCII texture**. The first four draw graphics over the original footage. Soft Dots and the earlier looks remain in the Look menu. The new build starts with Clean blobs.

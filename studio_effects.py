@@ -110,8 +110,11 @@ PRESETS = {
 
 
 def load_preset(path):
-    with path.open(encoding="utf-8") as stream:
-        data = json.load(stream)
+    with path.open(encoding="utf-8-sig") as stream:
+        return decode_preset_look(json.load(stream))
+
+
+def decode_preset_look(data):
     if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("look"), dict):
         raise ValueError("This is not a supported Nexus preset.")
     try:

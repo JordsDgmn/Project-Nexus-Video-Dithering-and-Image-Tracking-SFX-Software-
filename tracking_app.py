@@ -9,7 +9,7 @@ import sys
 from threading import Event, Thread
 import time
 import tkinter as tk
-from tkinter import colorchooser, filedialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
@@ -20,12 +20,16 @@ from dots_panel import DotsPanel
 from graphics_panel import GraphicsPanel
 from graphics_settings import CLEAN, GRAPHIC_MODES
 from nexus_diagnostics import DiagnosticsWindow, clock
-from nexus_preview import PreviewSpec, PreviewWorker
+from nexus_presets import (
+    FIRST_NAME, FIRST_PRESET, NexusPreset, default_target, install_first_preset, library_path,
+    load_settings, name_path, save_settings,
+)
+from nexus_preview import PREVIEW_QUALITY, AdaptivePreview, PreviewSpec, PreviewWorker
 from scene_effects import CCTV, SCENE_MODES
 from studio_effects import (
     ARTWORK, AUTO, FULL_FRAME_LOOKS, FULL_FRAME_MODES, MODES, OUTLINE,
     PRESETS, QUALITY, SCENE_LOOKS, SUBJECT, SURFACE, Look,
-    load_preset, save_preset, valid_quad,
+    valid_quad,
 )
 from tracking_effect import Cancelled, export_track, writes_tracking_data
 
@@ -39,7 +43,7 @@ ACCENT = "#78edbe"
 class TrackingApp(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Project Nexus — Tracking Lab")
+        self.title("Project Nexus — Live Studio")
         self.geometry("1100x780")
         self.minsize(920, 650)
         self.configure(bg=BG)
@@ -50,6 +54,10 @@ class TrackingApp(TkinterDnD.Tk):
         self.clip = self.displayed = self.inspector = self.dots_panel = self.graphics_panel = None
         self.worker = PreviewWorker()
         self.preview_token = self.pending_since = None
+        self.refresh_job = None
+        self.setting_look = False
+        self.preview_clock = None
+        self.adaptive = AdaptivePreview()
         self.preview_stats = self.preview_fps = self.last_presented = None
         self.preview_channel = "source"
         self.preview_playing = self.loading_clip = self.busy = False
@@ -65,6 +73,12 @@ class TrackingApp(TkinterDnD.Tk):
         self.mode = tk.StringVar(value=defaults.mode)
         self.target = tk.StringVar(value=AUTO)
         self.quality = tk.StringVar(value=defaults.quality)
+        self.preview_quality = tk.StringVar(value="Auto")
+        self.preview_info = tk.StringVar(value="")
+        self.preset_label = tk.StringVar(value="")
+        self.active_mode, self.active_target = defaults.mode, AUTO
+        self.saved_settings = NexusPreset(defaults)
+        self.preset_folder = library_path()
         self.opacity = tk.IntVar(value=defaults.opacity)
         self.detail = tk.IntVar(value=defaults.detail)
         self.tint = defaults.tint
@@ -84,6 +98,10 @@ class TrackingApp(TkinterDnD.Tk):
         self.corners = []
         self.filename = tk.StringVar(value="No video selected")
         self.status = tk.StringVar(value="Drop a video from File Explorer or click Open video.")
+        try:
+            install_first_preset(self.preset_folder)
+        except OSError as error:
+            self.status.set(f"Preset folder unavailable: {error}")
 
         style = ttk.Style(self)
         style.theme_use("clam")
@@ -137,9 +155,8 @@ class TrackingApp(TkinterDnD.Tk):
         bar.pack(fill="x", pady=(8, 7))
         self.effects = self.combo(bar, "Look", self.mode, MODES, 18)
         self.effects.bind("<<ComboboxSelected>>", self.choose_look)
-        self.look_button = self.button(bar, "Preview look", self.preview_look, "disabled")
+        self.look_button = self.button(bar, "Play preview", self.preview_look, "disabled")
         self.look_button.pack(side="left")
-        self.settings_row(bottom)
         self.preview_button = self.button(bar, "Watch export", self.play_preview, "disabled")
         self.preview_button.pack(side="left", padx=(12, 6))
         self.result_button = self.button(bar, "Open MP4", self.open_result, "disabled")
@@ -149,11 +166,27 @@ class TrackingApp(TkinterDnD.Tk):
         self.track_button = ttk.Button(bar, text="Export video", command=self.start,
                                        style="Track.TButton", state="disabled")
         self.track_button.pack(side="right")
+        workflow = tk.Frame(bottom, bg=BG)
+        workflow.pack(fill="x", pady=(0, 8))
+        self.save_button = ttk.Button(workflow, text="Save preset…", command=self.write_preset)
+        self.save_button.pack(side="left", padx=(0, 6))
+        self.load_button = ttk.Button(workflow, text="Load preset…", command=self.read_preset)
+        self.load_button.pack(side="left", padx=(0, 8))
+        self.label(workflow, textvariable=self.preset_label, color=MUTED, width=29).pack(side="left")
+        preview_settings = tk.Frame(workflow, bg=BG)
+        preview_settings.pack(side="right")
+        self.preview_menu = self.combo(preview_settings, "Preview quality", self.preview_quality,
+                                       tuple(PREVIEW_QUALITY), 12)
+        self.preview_menu.bind("<<ComboboxSelected>>", self.change_preview_quality)
+        self.label(preview_settings, textvariable=self.preview_info, color=MUTED, width=21).pack(side="left")
+        self.settings_row(bottom)
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.pack(fill="x")
         self.label(bottom, textvariable=self.status, color=ACCENT, wraplength=680).pack(anchor="w", pady=(5, 0))
         self.change_effect()
-
+        for value in (self.opacity, self.detail, self.tracking_speed, self.animation_speed, self.min_boxes,
+                      self.max_boxes, self.links, self.labels, self.trails, self.crops):
+            value.trace_add("write", self.schedule_refresh)
 
     def settings_row(self, bottom):
         self.advanced = ttk.Notebook(bottom)
@@ -189,7 +222,7 @@ class TrackingApp(TkinterDnD.Tk):
         switches = tk.Frame(layers, bg=BG)
         switches.pack(fill="x", pady=(6, 0))
         self.layer_fields = tuple(
-            ttk.Checkbutton(switches, text=label, variable=value, command=self.refresh_current)
+            ttk.Checkbutton(switches, text=label, variable=value)
             for label, value in (("Links", self.links), ("Labels", self.labels),
                                  ("Trails", self.trails), ("Live crops", self.crops))
         )
@@ -198,26 +231,21 @@ class TrackingApp(TkinterDnD.Tk):
         self.label(layers, text="Scene layers apply where supported by the selected look.", color=MUTED).pack(anchor="w", pady=(4, 0))
 
         self.sizes = self.combo(files, "Output size", self.quality, tuple(QUALITY), 16)
-        self.presets = ttk.Combobox(files, state="readonly", values=tuple(PRESETS), width=17)
+        self.presets = ttk.Combobox(files, state="readonly", values=(FIRST_NAME, *PRESETS), width=25)
         self.presets.set("Apply a preset…")
         self.presets.pack(side="left", padx=(0, 6))
         self.presets.bind("<<ComboboxSelected>>", self.apply_preset)
-        self.load_button = self.button(files, "Load preset…", self.read_preset)
-        self.load_button.pack(side="left", padx=(0, 5))
-        self.save_button = self.button(files, "Save preset…", self.write_preset)
-        self.save_button.pack(side="left")
+        self.label(files, text="Output size applies only to the exported video.", color=MUTED).pack(side="left")
         self.setting_buttons = (
             self.reset, self.opacity_field, self.detail_field, self.tint_button,
             self.load_button, self.save_button, *self.motion_fields, *self.layer_fields,
         )
-        self.setting_combos = (self.targets, self.effects, self.sizes, self.presets)
+        self.setting_combos = (self.targets, self.effects, self.sizes, self.presets, self.preview_menu)
 
     def spin(self, parent, label, variable, low, high):
         self.label(parent, text=label, color=MUTED).pack(side="left")
-        field = ttk.Spinbox(parent, from_=low, to=high, width=5, textvariable=variable,
-                            command=self.refresh_current)
+        field = ttk.Spinbox(parent, from_=low, to=high, width=5, textvariable=variable)
         field.pack(side="left", padx=(4, 12))
-        field.bind("<Return>", self.refresh_current)
         return field
 
     def show_inspector(self):
@@ -244,14 +272,7 @@ class TrackingApp(TkinterDnD.Tk):
         self.tint = look.tint
         for key in ("opacity", "tracking_speed", "min_boxes", "max_boxes", "links", "labels", "trails"):
             getattr(self, key).set(getattr(look, key))
-        if self.clip is None or self.loading_clip or self.compare.get():
-            return
-        if self.preview_playing and self.preview_channel == "source":
-            # The next frame request takes the current settings without pausing playback.
-            return
-        self.pause_preview()
-        self.preview_channel = "source"
-        self.request_frame(self.position)
+        self.schedule_refresh()
 
     def open_dots(self):
         if self.mode.get() != DOTS or self.busy:
@@ -265,8 +286,9 @@ class TrackingApp(TkinterDnD.Tk):
     def apply_dots(self, settings):
         if self.busy or self.mode.get() != DOTS:
             raise ValueError("Finish the export and select Soft Dots before editing.")
-        self.dots = settings
-        self.refresh_current()
+        if settings != self.dots:
+            self.dots = settings
+            self.schedule_refresh()
 
     def toggle_settings(self):
         self.advanced_visible = not self.advanced_visible
@@ -279,26 +301,38 @@ class TrackingApp(TkinterDnD.Tk):
 
     def choose_target(self, _event=None):
         target = self.target.get()
-        if target == AUTO and self.mode.get() not in FULL_FRAME_MODES:
-            self.set_look(SCENE_LOOKS[CCTV])
-        elif target != AUTO and self.mode.get() in FULL_FRAME_MODES:
-            self.mode.set(OUTLINE)
-        self.change_effect()
-        self.change_target()
+        self.target.set(self.active_target)
+        if target == self.active_target or not self.confirm_replace(f"switch to {target}"):
+            return
+        look = self.look_for_switch()
+        if target == AUTO:
+            look = SCENE_LOOKS[CCTV]
+        elif look.mode in FULL_FRAME_MODES:
+            look = with_settings(look, mode=OUTLINE)
+        self.set_look(look, keep_quality=True, target=target)
+        self.remember_settings()
 
     def choose_look(self, _event=None):
         mode = self.mode.get()
+        self.mode.set(self.active_mode)
+        if mode == self.active_mode or not self.confirm_replace(f"switch to {mode}"):
+            return
         if mode in FULL_FRAME_MODES:
             look = FULL_FRAME_LOOKS[mode]
             if mode in GRAPHIC_MODES and self.graphics.custom_text:
                 look = with_settings(look, graphics=with_settings(
                     look.graphics, custom_text=self.graphics.custom_text
                 ))
-            self.set_look(look, keep_quality=True)
-        elif self.target.get() == AUTO:
-            self.target.set(SUBJECT)
-            self.change_target()
-        self.change_effect()
+            self.set_look(look, keep_quality=True, target=AUTO)
+        else:
+            self.set_look(with_settings(self.look_for_switch(), mode=mode), keep_quality=True)
+        self.remember_settings()
+
+    def look_for_switch(self):
+        try:
+            return self.current_look()
+        except ValueError:
+            return self.saved_settings.look
 
     def combo(self, parent, label, variable, values, width):
         self.label(parent, text=label, color=MUTED).pack(side="left", padx=(0, 5))
@@ -317,7 +351,7 @@ class TrackingApp(TkinterDnD.Tk):
                 graphics=self.graphics,
             ).validate()
         except tk.TclError as error:
-            raise ValueError("Enter whole numbers for opacity and detail size.") from error
+            raise ValueError("Complete the numeric settings before applying or saving this look.") from error
 
     def change_effect(self, _event=None):
         is_dots = self.mode.get() == DOTS
@@ -355,57 +389,130 @@ class TrackingApp(TkinterDnD.Tk):
                 self.refresh_current()
 
 
-    def set_look(self, look, keep_quality=False):
-        automatic = look.mode in FULL_FRAME_MODES
-        changed_target = automatic != (self.target.get() == AUTO)
-        self.mode.set(look.mode)
-        if not keep_quality:
-            self.quality.set(look.quality)
-        for field in ("opacity", "detail", "tracking_speed", "animation_speed",
-                      "min_boxes", "max_boxes", "links", "labels", "trails", "crops"):
-            getattr(self, field).set(getattr(look, field))
-        self.tint, self.artwork, self.dots, self.graphics = look.tint, look.artwork, look.dots, look.graphics
-        if self.graphics_panel is not None and look.mode in GRAPHIC_MODES:
-            self.graphics_panel.synchronize(look)
-        if self.dots_panel is not None and look.mode == DOTS:
-            self.dots_panel.set_settings(self.dots)
+    def set_look(self, look, keep_quality=False, target=None):
+        if target is None:
+            automatic = look.mode in FULL_FRAME_MODES
+            target = AUTO if automatic else SUBJECT if self.active_target == AUTO else self.active_target
+        changed_target = target != self.active_target
+        self.setting_look = True
+        try:
+            self.active_mode, self.active_target = look.mode, target
+            self.mode.set(look.mode)
+            self.target.set(target)
+            if not keep_quality:
+                self.quality.set(look.quality)
+            for field in ("opacity", "detail", "tracking_speed", "animation_speed",
+                          "min_boxes", "max_boxes", "links", "labels", "trails", "crops"):
+                getattr(self, field).set(getattr(look, field))
+            self.tint, self.artwork = look.tint, look.artwork
+            self.dots, self.graphics = look.dots, look.graphics
+            if self.graphics_panel is not None and look.mode in GRAPHIC_MODES:
+                self.graphics_panel.synchronize(look)
+            if self.dots_panel is not None and look.mode == DOTS:
+                self.dots_panel.set_settings(self.dots)
+            self.change_effect()
+        finally:
+            self.setting_look = False
         if changed_target:
-            self.target.set(AUTO if automatic else SUBJECT)
             self.change_target()
         else:
             self.refresh_current()
-        self.change_effect()
+
+    def capture_settings(self):
+        if self.dots_panel is not None and not self.dots_panel.apply():
+            raise ValueError("Check the highlighted settings in Soft Dots.")
+        if self.graphics_panel is not None and not self.graphics_panel.flush():
+            raise ValueError("Check the settings in Live controls.")
+        return NexusPreset(self.current_look(), self.target.get(), self.preview_quality.get()).validate()
+
+    def remember_settings(self, settings=None, name=None):
+        if settings is None:
+            mode = self.active_mode
+            default = FULL_FRAME_LOOKS.get(mode, Look(mode))
+            settings = NexusPreset(with_settings(default, quality=self.quality.get()),
+                                   self.active_target, self.preview_quality.get())
+        self.saved_settings = settings
+        self.preset_label.set(name or "")
+
+    def confirm_replace(self, action, replacement=None):
+        try:
+            current = self.capture_settings()
+        except ValueError as error:
+            return messagebox.askokcancel("Incomplete settings",
+                                          f"{error}\n\nDiscard the incomplete edits and {action}?",
+                                          default="cancel", parent=self)
+        if current == self.saved_settings or current == replacement:
+            return True
+        answer = messagebox.askyesnocancel(
+            "Save your settings?",
+            f"Save your current changes before you {action}?\n\n"
+            "Yes saves a preset. No continues. Cancel keeps editing.",
+            default="cancel", parent=self,
+        )
+        return self.write_preset(current) if answer is True else answer is False
+
+    def use_preset(self, settings, name):
+        if not self.confirm_replace(f"load {name}", settings):
+            return False
+        self.preview_quality.set(settings.preview)
+        self.adaptive = AdaptivePreview()
+        self.set_look(settings.look, target=settings.target)
+        self.remember_settings(settings, name)
+        self.status.set(f"Loaded {name}.")
+        return True
 
     def apply_preset(self, _event):
         name = self.presets.get()
-        self.set_look(PRESETS[name])
         self.presets.set("Apply a preset…")
-        self.status.set(f"Applied {name}.")
+        try:
+            if name == FIRST_NAME:
+                path = name_path(self.preset_folder, name)
+                settings = load_settings(path) if path.is_file() else FIRST_PRESET
+            else:
+                look = PRESETS[name]
+                settings = NexusPreset(look, default_target(look), self.preview_quality.get())
+            self.use_preset(settings, name)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not load preset", str(error), parent=self)
 
     def read_preset(self):
         path = filedialog.askopenfilename(parent=self, title="Load a Nexus preset",
+                                          initialdir=self.preset_folder,
                                           filetypes=[("Nexus preset", "*.json")])
         if path:
+            path = Path(path)
             try:
-                self.set_look(load_preset(Path(path)))
+                settings = load_settings(path)
             except (OSError, ValueError) as error:
-                self.status.set(f"Could not load preset: {error}")
-            else:
-                self.status.set(f"Loaded preset {Path(path).stem}.")
+                messagebox.showerror("Could not load preset", str(error), parent=self)
+                return
+            self.use_preset(settings, path.stem)
 
-    def write_preset(self):
-        path = filedialog.asksaveasfilename(parent=self, title="Save a new Nexus preset",
-                                           defaultextension=".json",
-                                           filetypes=[("Nexus preset", "*.json")])
-        if path:
-            try:
-                save_preset(Path(path), self.current_look())
-            except FileExistsError:
-                self.status.set("That preset already exists. Choose a new name.")
-            except (OSError, ValueError) as error:
-                self.status.set(f"Could not save preset: {error}")
-            else:
-                self.status.set(f"Saved preset {Path(path).stem}.")
+    def write_preset(self, settings=None):
+        try:
+            if settings is None:
+                settings = self.capture_settings()
+        except ValueError as error:
+            messagebox.showerror("Could not save preset", str(error), parent=self)
+            return False
+        name = simpledialog.askstring("Save preset", "Preset name", initialvalue=self.preset_label.get(),
+                                      parent=self)
+        if name is None:
+            return False
+        try:
+            path = name_path(self.preset_folder, name)
+            exists = path.exists()
+            if exists and not messagebox.askyesno("Replace saved preset?",
+                                                  f"Replace {path.stem} with these settings?",
+                                                  default="no", parent=self):
+                return False
+            save_settings(path, settings, replace=exists)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not save preset", str(error), parent=self)
+            return False
+        self.remember_settings(settings, path.stem)
+        self.status.set(f"Saved {path.stem}.")
+        return True
 
 
     def change_target(self, _event=None):
@@ -430,15 +537,39 @@ class TrackingApp(TkinterDnD.Tk):
                 "Drag a rectangle around the subject you want to follow.")
         self.status.set(text)
 
-    def refresh_current(self, _event=None):
-        if self.clip is None or self.loading_clip or self.busy:
+    def schedule_refresh(self, *_):
+        if not self.setting_look and self.refresh_job is None:
+            self.refresh_job = self.after(65, self.flush_refresh)
+
+    def flush_refresh(self):
+        self.refresh_job = None
+        self.refresh_current()
+
+    def refresh_current(self):
+        if self.clip is None or self.loading_clip or self.busy or self.compare.get():
             return
         if self.target.get() != AUTO and self.box is None:
             return
+        if self.preview_playing and self.preview_channel == "source":
+            return
+        if self.scrub_job is not None:
+            self.after_cancel(self.scrub_job)
+            self.scrub_job = None
         self.pause_preview()
         self.preview_channel = "source"
-        self.compare.set(False)
-        self.request_frame(self.position, reason="Updating look…")
+        self.request_frame(self.position)
+
+    def change_preview_quality(self, _event=None):
+        self.adaptive = AdaptivePreview()
+        if self.clip is not None and not self.loading_clip and not self.busy and not self.preview_playing:
+            if self.displayed is not None or self.target.get() == AUTO or self.compare.get():
+                self.request_frame(self.position)
+
+    def preview_edge(self):
+        preset = self.preview_quality.get()
+        if preset == "Auto":
+            return self.adaptive.edge
+        return PREVIEW_QUALITY[preset]
 
     def preview_look(self):
         self.toggle_play("source")
@@ -489,6 +620,7 @@ class TrackingApp(TkinterDnD.Tk):
     def accept_clip(self, clip, frame):
         self.loading_clip = False
         self.clip = clip
+        self.adaptive = AdaptivePreview()
         self.source, self.first = clip.path, frame
         self.box = self.result = self.anchor = None
         self.compare.set(False)
@@ -623,17 +755,16 @@ class TrackingApp(TkinterDnD.Tk):
         if (self.busy or self.loading_clip or self.source is None
                 or (self.box is None and self.target.get() != AUTO)):
             return
-        if self.graphics_panel is not None:
-            self.graphics_panel.flush()
-        self.stop_preview()
         try:
-            look = self.current_look()
+            settings = self.capture_settings()
+            look = settings.look
             if look.mode == ARTWORK and not look.artwork:
                 raise ValueError("Choose a PNG or JPG overlay first.")
         except ValueError as error:
             self.status.set(str(error))
             return
-        planar = self.target.get() == SURFACE
+        self.stop_preview()
+        planar = settings.target == SURFACE
         has_data = writes_tracking_data(look)
         suffix = "dots" if look.mode == DOTS else "tracked" if has_data else "ascii"
         stem = f"{self.source.stem}-{suffix}"
@@ -818,6 +949,7 @@ class TrackingApp(TkinterDnD.Tk):
             self.set_timeline(0)
         self.preview_playing = True
         self.last_presented = None
+        self.preview_clock = time.monotonic(), self.position
         button = self.preview_button if channel == "export" else self.look_button
         button.configure(text="Pause")
         self.request_frame(self.position, reason="Buffering preview…")
@@ -856,10 +988,11 @@ class TrackingApp(TkinterDnD.Tk):
 
     def pause_preview(self):
         self.preview_playing = False
+        self.preview_clock = None
         if self.play_job is not None:
             self.after_cancel(self.play_job)
             self.play_job = None
-        self.look_button.configure(text="Preview look")
+        self.look_button.configure(text="Play preview")
         self.preview_button.configure(text="Watch export")
         if self.activity == "Playing preview":
             self.activity = "Ready"
@@ -869,6 +1002,9 @@ class TrackingApp(TkinterDnD.Tk):
         if self.scrub_job is not None:
             self.after_cancel(self.scrub_job)
             self.scrub_job = None
+        if self.refresh_job is not None:
+            self.after_cancel(self.refresh_job)
+            self.refresh_job = None
         self.worker.request("reset")
         self.preview_token = None
         if self.preview_poll is not None:
@@ -877,6 +1013,7 @@ class TrackingApp(TkinterDnD.Tk):
         self.end_buffer()
         self.preview_channel = "source"
         self.displayed = None
+        self.preview_info.set("")
         self.set_timeline(0)
         self.show(self.first)
 
@@ -898,16 +1035,20 @@ class TrackingApp(TkinterDnD.Tk):
         self.play_job = None
         if self.clip is None or self.loading_clip or self.busy:
             return
+        edge = self.preview_edge()
         if self.preview_channel == "export" and self.result is not None:
-            spec = PreviewSpec(self.result)
+            spec = PreviewSpec(self.result, edge=edge)
         else:
             try:
                 look = None if self.compare.get() else self.current_look()
-                spec = PreviewSpec(self.source, look, self.box, self.target.get() == SURFACE)
+                if look is not None:
+                    look = with_settings(look, quality=Look().quality)
+                spec = PreviewSpec(self.source, look, self.box, self.target.get() == SURFACE, edge)
             except ValueError as error:
-                self.pause_preview()
                 self.end_buffer()
                 self.status.set(str(error))
+                if self.preview_playing:
+                    self.play_job = self.after(90, self.request_frame, frame)
                 return
         if reason:
             self.begin_buffer(reason)
@@ -981,8 +1122,29 @@ class TrackingApp(TkinterDnD.Tk):
             else:
                 self.activity = "Playing preview"
                 rate = self.clip.fps or 30
-                delay = max(1, round((1 / rate - latency) * 1000))
-                self.play_job = self.after(delay, self.request_frame, frame + 1)
+                if self.preview_quality.get() == "Auto":
+                    self.adaptive.observe(latency, rate)
+                if self.can_skip_preview_frames():
+                    start, origin = self.preview_clock
+                    delay = max(1, round(1000 * (start + (frame + 1 - origin) / rate - now)))
+                else:
+                    delay = max(1, round((1 / rate - latency) * 1000))
+                self.play_job = self.after(delay, self.advance_preview, frame + 1)
+        height, width = image.shape[:2]
+        speed = f" · {self.preview_fps:.0f} fps" if self.preview_playing and self.preview_fps else ""
+        self.preview_info.set(f"{width} × {height}{speed}")
+
+    def can_skip_preview_frames(self):
+        return self.preview_channel == "export" or self.active_target == AUTO or self.compare.get()
+
+    def advance_preview(self, next_frame):
+        if self.can_skip_preview_frames() and self.preview_clock is not None:
+            start, origin = self.preview_clock
+            target = origin + int((time.monotonic() - start) * (self.clip.fps or 30))
+            total = self.timeline_length()
+            if total:
+                next_frame = min(total - 1, max(next_frame, target))
+        self.request_frame(next_frame)
 
     def open_result(self):
         try:

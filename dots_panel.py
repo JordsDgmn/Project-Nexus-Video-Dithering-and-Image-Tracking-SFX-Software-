@@ -18,12 +18,15 @@ class DotsPanel(tk.Toplevel):
         self.minsize(560, 535)
         self.configure(bg="#111827")
         self.transient(app)
-        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.protocol("WM_DELETE_WINDOW", self.finish)
+        self.pending = None
+        self.synchronizing = False
         self.values = {}
         for key, value in asdict(settings).items():
             kind = tk.BooleanVar if type(value) is bool else tk.IntVar if type(value) is int else tk.StringVar
             self.values[key] = kind(self, value)
-        self.message = tk.StringVar(value="Apply updates the current preview frame.")
+            self.values[key].trace_add("write", self.schedule)
+        self.message = tk.StringVar(value="Changes update the preview while it plays or pauses.")
         book = ttk.Notebook(self)
         book.pack(fill="both", expand=True, padx=15, pady=(15, 7))
         for name, populate in (("Dots", self.dots), ("Backdrop", self.backdrop),
@@ -37,7 +40,7 @@ class DotsPanel(tk.Toplevel):
         buttons = ttk.Frame(self, padding=(10, 6))
         buttons.pack(fill="x", padx=15, pady=(0, 12))
         ttk.Button(buttons, text="Reset to reference", command=self.reset).pack(side="left")
-        ttk.Button(buttons, text="Close", command=self.close).pack(side="right")
+        ttk.Button(buttons, text="Close", command=self.finish).pack(side="right")
         ttk.Button(buttons, text="Apply to preview", command=self.apply).pack(side="right", padx=8)
 
     def dots(self, tab):
@@ -116,23 +119,43 @@ class DotsPanel(tk.Toplevel):
         if color:
             self.values[key].set(color)
 
+    def cancel_pending(self):
+        if self.pending is not None:
+            self.after_cancel(self.pending)
+            self.pending = None
+
     def set_settings(self, settings):
+        self.cancel_pending()
+        self.synchronizing = True
         for key, value in asdict(settings).items():
             self.values[key].set(value)
+        self.synchronizing = False
+
+    def schedule(self, *_):
+        if not self.synchronizing and self.pending is None:
+            self.pending = self.after(65, self.apply)
 
     def reset(self):
-        self.set_settings(DotsSettings())
-        self.apply()
+        if self.app.confirm_replace("reset Soft Dots to its reference values"):
+            self.set_settings(DotsSettings())
+            self.apply()
 
     def apply(self):
+        self.cancel_pending()
         try:
             settings = DotsSettings(**{key: value.get() for key, value in self.values.items()}).validate()
             self.app.apply_dots(settings)
         except (tk.TclError, ValueError) as error:
             self.message.set(str(error))
-        else:
-            self.message.set("Applied. Save a preset to reuse these settings.")
+            return False
+        self.message.set("Preview updated. Save a preset to reuse these settings.")
+        return True
+
+    def finish(self):
+        if self.apply():
+            self.close()
 
     def close(self):
+        self.cancel_pending()
         self.app.dots_panel = None
         self.destroy()

@@ -17,10 +17,11 @@ class GraphicsPanel(tk.Toplevel):
         self.title("Nexus · Live tracking controls")
         self.geometry("650x575")
         self.minsize(590, 540)
-        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.protocol("WM_DELETE_WINDOW", self.finish)
         self.pending = None
         self.syncing = False
         self.last_field = ""
+        self.valid = True
         self.variables = {}
         for key, value in asdict(look.graphics).items():
             if key != "custom_text":
@@ -45,7 +46,7 @@ class GraphicsPanel(tk.Toplevel):
         bottom.pack(fill="x", padx=12, pady=(0, 9))
         self.message = tk.StringVar(value="Changes update the preview while it plays.")
         ttk.Label(bottom, textvariable=self.message, wraplength=480).pack(side="left", fill="x", expand=True)
-        ttk.Button(bottom, text="Close", command=self.close).pack(side="right")
+        ttk.Button(bottom, text="Close", command=self.finish).pack(side="right")
 
     def add_variable(self, key, value):
         cls = tk.BooleanVar if type(value) is bool else tk.IntVar if type(value) is int else tk.StringVar
@@ -195,10 +196,14 @@ class GraphicsPanel(tk.Toplevel):
             self.app.apply_graphics(config, values)
         except (tk.TclError, ValueError) as error:
             self.message.set(str(error))
+            self.valid = False
         else:
             self.message.set("Preview updated. Save a preset to reuse these settings.")
+            self.valid = True
+        return self.valid
 
     def synchronize(self, look):
+        self.valid = True
         if self.pending is not None:
             self.after_cancel(self.pending)
             self.pending = None
@@ -214,9 +219,17 @@ class GraphicsPanel(tk.Toplevel):
         self.syncing = False
 
     def flush(self):
-        if self.pending is not None:
-            self.after_cancel(self.pending)
-            self.apply()
+        if self.pending is not None or self.words.get("1.0", "end-1c") != self.app.graphics.custom_text:
+            if self.pending is not None:
+                self.after_cancel(self.pending)
+            if self.words.get("1.0", "end-1c") != self.app.graphics.custom_text:
+                self.last_field = "custom_text"
+            return self.apply()
+        return self.valid
+
+    def finish(self):
+        if self.flush():
+            self.close()
 
     def close(self):
         if self.pending is not None:

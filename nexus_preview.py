@@ -16,6 +16,10 @@ from studio_effects import Effect, box_corners, surface_frames
 from track import tracked_frames
 
 
+AUTO_EDGES = (960, 800, 640, 520, 420)
+PREVIEW_QUALITY = {"Auto": AUTO_EDGES[0], "Performance": 520, "Balanced": 820, "High": 1440}
+
+
 @dataclass(frozen=True)
 class Clip:
     path: Path
@@ -38,6 +42,27 @@ class PreviewSpec:
     look: object = None
     selection: tuple = None
     planar: bool = False
+    edge: int = 820
+
+
+class AdaptivePreview:
+    def __init__(self):
+        self.level = self.slow = self.fast = 0
+
+    @property
+    def edge(self):
+        return AUTO_EDGES[self.level]
+
+    def observe(self, latency, fps):
+        budget = 1 / min(60, max(12, fps))
+        self.slow = self.slow + 1 if latency > .96 * budget else 0
+        self.fast = self.fast + 1 if latency < .56 * budget else 0
+        if self.slow >= 3 and self.level < len(AUTO_EDGES) - 1:
+            self.level += 1
+            self.slow = self.fast = 0
+        elif self.fast >= 45 and self.level:
+            self.level -= 1
+            self.slow = self.fast = 0
 
 
 class Superseded(Exception):
@@ -75,11 +100,11 @@ def inspect_clip(path):
         capture.release()
 
 
-def preview_size(frame):
+def preview_size(frame, edge):
     height, width = frame.shape[:2]
-    if max(width, height) <= 820:
+    if max(width, height) <= edge:
         return frame
-    scale = 820 / max(width, height)
+    scale = edge / max(width, height)
     return cv2.resize(frame, (max(1, round(width * scale)), max(1, round(height * scale))),
                       interpolation=cv2.INTER_AREA)
 
@@ -100,30 +125,60 @@ class Stream:
         self.manual = (spec.look is not None and self.dots is None
                        and not self.auto and spec.selection is not None)
         self.tracker = self.iterator = self.effect = None
-        self.raw = None
+        self.original = self.raw = self.region = None
         self.tracks = ()
 
     def retune(self, spec):
-        if not (self.auto and spec.path == self.spec.path and spec.look is not None
-                and spec.look.mode in SCENE_MODES):
+        previous = self.spec
+        old, new = previous.look, spec.look
+        if previous.path != spec.path or (old is None) != (new is None):
             return False
-        old, new = self.spec.look, spec.look
+        if new is not None:
+            auto = new.mode in SCENE_MODES
+            dots = new.mode == DOTS
+            if auto != self.auto or dots != (self.dots is not None):
+                return False
+            if (previous.selection, previous.planar) != (spec.selection, spec.planar):
+                return False
+            if self.auto:
+                track = needs_scene_tracks(new)
+                if track and (track != self.track or previous.edge != spec.edge
+                              or old.graphics.detection_key() != new.graphics.detection_key()
+                              or old.detail != new.detail):
+                    self.tracker = None
+                    self.raw = None
+                elif track and self.tracker is not None:
+                    self.tracker.configure(new.detail, new)
+                    self.tracks = self.tracks[:new.max_boxes]
+                self.track = track
+            elif self.dots is not None and old.dots != new.dots:
+                self.dots = DotsRenderer(new.dots)
+            elif self.manual and old != new:
+                self.effect = Effect(new)
         self.spec = spec
-        track = needs_scene_tracks(new)
-        changed = track != self.track
-        self.track = track
-        if self.track and (changed or old.graphics.detection_key() != new.graphics.detection_key()
-                           or old.detail != new.detail):
-            self.tracker = None
-            self.last = None
-        else:
-            if self.track and self.tracker is not None:
-                self.tracker.configure(new.detail, new)
-            if self.raw is not None:
-                self.tracks = self.tracks[:new.max_boxes] if self.track else ()
-                self.last = paint_scene(self.raw, self.tracks, new, self.index, self.fps,
-                                        self.tracker.crop_ids if self.track and self.tracker else None)
+        if self.original is not None and (not self.track or self.tracker is not None):
+            if previous.edge != spec.edge:
+                self.raw = preview_size(self.original, spec.edge)
+        self.last = None
         return True
+
+    def paint(self):
+        frame = self.raw
+        if self.auto:
+            return paint_scene(frame, self.tracks if self.track else (), self.spec.look, self.index, self.fps,
+                               self.tracker.crop_ids if self.track and self.tracker is not None else None)
+        if self.dots is not None:
+            return self.dots.frame(frame)
+        if self.manual:
+            quad = None
+            if self.region is not None:
+                region = self.region if self.spec.planar else box_corners(self.region)
+                scale = np.float32((frame.shape[1] / self.original.shape[1],
+                                    frame.shape[0] / self.original.shape[0]))
+                quad = np.float32(region) * scale
+            frame = frame.copy()
+            self.effect.apply(frame, quad, self.spec.planar)
+        return frame
 
     def close(self):
         self.capture.release()
@@ -136,7 +191,9 @@ class Stream:
         self.index = index - 1
 
     def frame_at(self, target, cancelled, progress):
-        if target == self.index and self.last is not None:
+        if target == self.index and self.raw is not None:
+            if self.last is None:
+                self.last = self.paint()
             return self.last
         if self.track and (self.tracker is None or target < self.index or target > self.index + 15):
             self.jump(max(0, target - 10))
@@ -159,29 +216,20 @@ class Stream:
                     original, region = next(self.iterator)
                 except StopIteration as error:
                     raise EOFError from error
-                frame = preview_size(original)
-                quad = None
-                if region is not None:
-                    quad = region if self.spec.planar else box_corners(region)
-                    quad = quad * (frame.shape[1] / original.shape[1], frame.shape[0] / original.shape[0])
-                    quad = np.float32(quad)
-                self.effect.apply(frame, quad, self.spec.planar)
+                self.region = region
             else:
                 ok, original = self.capture.read()
                 if not ok:
                     raise EOFError
-                frame = preview_size(original)
-                if self.auto:
-                    self.raw = frame
-                    self.tracks = self.tracker.update(frame) if self.track else ()
-                    frame = paint_scene(frame, self.tracks, self.spec.look, self.index + 1,
-                                        self.fps, self.tracker.crop_ids if self.track else None)
-                elif self.dots is not None:
-                    frame = self.dots.frame(frame)
+            self.original = original
+            self.raw = preview_size(original, self.spec.edge)
             self.index += 1
-            self.last = frame
+            self.last = None
+            if self.track:
+                self.tracks = self.tracker.update(self.raw)
             if self.manual and self.index < target and self.index % 12 == 0:
                 progress(self.index, target)
+        self.last = self.paint()
         return self.last
 
 
