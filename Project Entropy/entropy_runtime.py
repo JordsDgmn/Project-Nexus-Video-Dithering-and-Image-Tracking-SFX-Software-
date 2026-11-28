@@ -39,9 +39,9 @@ class PreviewWorker:
         self.thread = Thread(target=self.run, daemon=True, name="Entropy preview")
         self.thread.start()
 
-    def request(self, ticket, size, phase, look):
+    def request(self, ticket, size, phase, look, seconds):
         with self.changed:
-            self.pending = (ticket, size, phase, look)
+            self.pending = (ticket, size, phase, look, seconds)
             self.changed.notify()
 
     def close(self):
@@ -58,14 +58,14 @@ class PreviewWorker:
                 self.changed.wait_for(lambda: self.pending is not None or self.closed)
                 if self.closed:
                     return
-                ticket, size, phase, look = self.pending
+                ticket, size, phase, look, seconds = self.pending
                 self.pending = None
             now = perf_counter()
             try:
                 if previous != size:
                     simulator = Simulator(size)
                     previous = size
-                frame = simulator.frame(phase, look)
+                frame = simulator.frame(phase, look, seconds)
                 result = (ticket, size, frame, perf_counter() - now, None)
             except Exception as error:
                 result = (ticket, size, None, perf_counter() - now,
@@ -81,7 +81,7 @@ class PreviewWorker:
 
 
 def frame_at(simulator, index, spec, look):
-    frame = simulator.frame(index / spec.frames, look)
+    frame = simulator.frame(index / spec.frames, look, spec.seconds)
     if spec.internal != spec.size:
         frame = cv2.resize(frame, spec.size, interpolation=cv2.INTER_LINEAR)
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)

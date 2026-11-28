@@ -12,6 +12,11 @@ from entropy_texture import Texture, TextureStack
 
 
 MAX_EXPORT_SECONDS = 30 * 60
+BASE_MOTION_SECONDS = 6
+SEAMLESS = "Seamless clip"
+EXACT = "Exact speed"
+LOOP_FITS = (SEAMLESS, EXACT)
+ROTATION_DIRECTIONS = ("Clockwise", "Counterclockwise")
 
 
 AURA = "Prismatic aura"
@@ -54,14 +59,22 @@ class Look:
     seed: int = 17
     colors: tuple = ()
     textures: Texture = field(default_factory=Texture)
+    motion_speed: int = 100
+    loop_fit: str = SEAMLESS
+    rotation_angle: int = 0
+    rotation_speed: int = 0
+    rotation_direction: str = "Clockwise"
 
     def validate(self):
         if self.mode not in MODES or self.palette not in (*PALETTES, CUSTOM) or self.blend not in BLENDS:
             raise ValueError("Choose a supported effect, palette and blend mode.")
+        if self.loop_fit not in LOOP_FITS or self.rotation_direction not in ROTATION_DIRECTIONS:
+            raise ValueError("Choose a supported loop mode and rotation direction.")
         for key, low, high in (
             ("hue", -180, 180), ("spectrum", 1, 200), ("saturation", 0, 150),
             ("scatter", 0, 100), ("compact", 0, 100), ("dispersion", 0, 100),
             ("glow", 0, 100), ("intensity", 0, 150), ("cycles", 0, 5), ("seed", 0, 999999),
+            ("motion_speed", 0, 400), ("rotation_angle", -180, 180), ("rotation_speed", 0, 360),
         ):
             value = getattr(self, key)
             if type(value) is not int or not low <= value <= high:
@@ -74,6 +87,25 @@ class Look:
             raise ValueError("Invalid texture settings.")
         self.textures.validate()
         return self
+
+
+@dataclass(frozen=True)
+class Timing:
+    motion_cycles: float
+    rotation_turns: float
+
+
+def clip_timing(look, seconds):
+    base = min(seconds, BASE_MOTION_SECONDS)
+    motion = look.cycles * (look.motion_speed / 100) * (seconds / base)
+    rotation = look.rotation_speed * seconds / 360
+    if look.loop_fit == SEAMLESS:
+        # A positive setting still produces motion on very short clips.
+        motion = max(1, math.floor(motion + .5)) if motion else 0
+        rotation = max(1, math.floor(rotation + .5)) if rotation else 0
+    if look.rotation_direction == "Counterclockwise":
+        rotation = -rotation
+    return Timing(motion, rotation)
 
 
 def validate_colors(colors):
@@ -219,8 +251,10 @@ class Simulator:
         palette = look.colors if look.palette == CUSTOM else PALETTES[look.palette]
         return spectral_lut(tuple(palette), look.saturation)[np.minimum(2047, (phase * 2048).astype(np.int32))]
 
-    def frame(self, turn, look):
-        position = (turn % 1) * look.cycles % 1
+    def frame(self, turn, look, seconds=BASE_MOTION_SECONDS):
+        timing = clip_timing(look, seconds)
+        progress = turn % 1 if look.loop_fit == SEAMLESS else turn
+        position = (progress * timing.motion_cycles) % 1
         t = math.tau * position
         phase = phases(look.seed)
         scatter = look.scatter / 100
@@ -282,6 +316,12 @@ class Simulator:
         result += self.noise[:, :, None]
         np.clip(result, 0, 1, out=result)
         frame = cv2.convertScaleAbs(result, alpha=255)
+        rotation = math.remainder(look.rotation_angle + progress * timing.rotation_turns * 360, 360)
+        if abs(rotation) > 1e-8:
+            center = ((self.width - 1) / 2, (self.height - 1) / 2)
+            transform = cv2.getRotationMatrix2D(center, -rotation, 1)
+            frame = cv2.warpAffine(frame, transform, (self.width, self.height),
+                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
         if look.textures.active:
             if self.textures is None:
                 self.textures = TextureStack((self.width, self.height))

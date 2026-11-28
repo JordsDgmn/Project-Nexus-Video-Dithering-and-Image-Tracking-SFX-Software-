@@ -4,7 +4,7 @@ A local Windows backdrop simulator. Choose an effect, shape the light and motion
 
 ## Use Entropy
 
-1. Open `dist/Project Entropy Studio v3.exe`.
+1. Open `dist/Project Entropy Studio v4.exe`.
 2. Choose **Prismatic aura**, **Iridescent oil**, **Glass caustics**, **Pool reflections**, **Prism refraction**, or **Cinematic bokeh**. The simulation starts immediately.
 3. Use **Light** for palette, hue, spectrum width, saturation, dispersion, glow, intensity, background, and blend. Use **Motion** for scatteredness, compactness, cycles, and the repeatable seed. Scrub the timeline to inspect a still, then press **Play**.
 4. Under **Export**, set the aspect, resolution, frame rate, duration, and render detail. **Estimate render time** samples the current settings before encoding. While exporting, the app measures throughput and updates its remaining-time estimate.
@@ -48,3 +48,12 @@ Run the focused settings checks with `python -m unittest discover -s tests`.
 - Open **Palettes** to choose or enter up to ten ordered colors. Save them under a name to use in other simulations. The editor lets you reorder colors or load and rename a saved palette.
 - Open **Presets** to save, apply, rename, or update a named look. Each preset includes the simulation, texture stack, custom colors, and export settings. JSON files remain available for transfer.
 - Named palettes and presets are saved in `.entropy-data/library.sqlite3`. Rendered samples and two portable JSON presets are in `examples/textures`.
+
+## Motion speed and rotation
+
+**Motion → Motion speed %** sets the speed independently of the exported duration.
+**Base cycles** controls how many effect cycles run at 100% during a six-second clip or a shorter clip. Longer clips repeat the same movement instead of stretching a single cycle over the entire export.
+
+**Rotation** sets a starting angle, rotation rate in degrees per second, and clockwise or counterclockwise direction. Rotation still works when the effect motion is frozen.
+
+**Motion → Clip timing** defaults to **Seamless clip**, which fits whole motion cycles and turns into the exported clip. The Motion and Rotation tabs show the resulting rates. **Exact speed** keeps the requested rates, so the final clip can end partway through a cycle or turn. Preview and export use the same timing.

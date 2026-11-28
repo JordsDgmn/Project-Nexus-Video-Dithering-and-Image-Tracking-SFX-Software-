@@ -22,8 +22,8 @@ import cv2
 
 from entropy_diagnostics import DiagnosticsWindow, SessionLog, project_directory
 from entropy_engine import (
-    BLENDS, CUSTOM, MAX_EXPORT_SECONDS, MODES, PALETTES, POOL, PRESETS, RATIOS, ExportSpec, Look,
-    capped, decode_look, validate_colors,
+    BLENDS, CUSTOM, LOOP_FITS, MAX_EXPORT_SECONDS, MODES, PALETTES, POOL, PRESETS,
+    RATIOS, ROTATION_DIRECTIONS, ExportSpec, Look, capped, clip_timing, decode_look, validate_colors,
 )
 from entropy_library import Library
 from entropy_studio import PalettesWindow, PresetsWindow, TexturesWindow
@@ -177,6 +177,8 @@ class EntropyApp(tk.Tk):
         self.preview_status = tk.StringVar(value="Starting preview…")
         self.preview_info = tk.StringVar(value="—")
         self.resolution = tk.StringVar()
+        self.motion_summary = tk.StringVar()
+        self.rotation_summary = tk.StringVar()
         self.job_status = tk.StringVar(value="Ready to export")
         self.form_status = tk.StringVar()
         self.issue_text = tk.StringVar(value="Diagnostics")
@@ -309,7 +311,8 @@ class EntropyApp(tk.Tk):
 
         tabs = ttk.Notebook(side)
         tabs.grid(row=2, column=0, sticky="nsew")
-        for name, build in (("Light", self.light_page), ("Motion", self.motion_page), ("Export", self.export_page)):
+        for name, build in (("Light", self.light_page), ("Motion", self.motion_page),
+                            ("Rotation", self.rotation_page), ("Export", self.export_page)):
             page = tk.Frame(tabs, bg=PANEL, padx=8, pady=5)
             tabs.add(page, text=name)
             build(page)
@@ -382,12 +385,24 @@ class EntropyApp(tk.Tk):
     def motion_page(self, page):
         for caption, key, low, high in (
                 ("Scatteredness", "scatter", 0, 100), ("Compactness", "compact", 0, 100),
-                ("Cycles per loop", "cycles", 0, 5)):
+                ("Base cycles", "cycles", 0, 5), ("Motion speed %", "motion_speed", 0, 400)):
             self.slider(page, caption, key, low, high)
-        self.number(page, "Seed", self.fields["seed"], 0, 999999)
-        ttk.Button(page, text="Randomize seed", command=self.randomize).pack(anchor="w", pady=6)
-        self.label(page, "A seed keeps the same pattern. Zero cycles holds a still frame.",
-                   color=MUTED, bg=PANEL, wraplength=273).pack(fill="x", pady=(4, 0))
+        self.choice(page, "Clip timing", self.fields["loop_fit"], LOOP_FITS)
+        seed = self.number(page, "Seed", self.fields["seed"], 0, 999999)
+        ttk.Button(seed, text="Randomize", command=self.randomize).pack(side="right", padx=5)
+        self.label(page, variable=self.motion_summary, color=ACCENT, bg=PANEL, wraplength=275).pack(
+            fill="x", pady=(4, 0))
+        self.label(page, "100% keeps the six-second pace on longer clips.", color=MUTED,
+                   bg=PANEL, wraplength=275).pack(fill="x", pady=(3, 0))
+
+    def rotation_page(self, page):
+        self.slider(page, "Starting angle °", "rotation_angle", -180, 180)
+        self.slider(page, "Rotation speed °/s", "rotation_speed", 0, 360)
+        self.choice(page, "Direction", self.fields["rotation_direction"], ROTATION_DIRECTIONS)
+        self.label(page, variable=self.rotation_summary, color=ACCENT, bg=PANEL, wraplength=275).pack(
+            fill="x", pady=(6, 0))
+        self.label(page, "Rotation is independent of the effect’s motion. Clip timing in Motion applies to both.",
+                   color=MUTED, bg=PANEL, wraplength=275).pack(fill="x", pady=(5, 0))
 
     def export_page(self, page):
         self.choice(page, "Aspect ratio", self.output["ratio"], tuple(RATIOS))
@@ -510,6 +525,11 @@ class EntropyApp(tk.Tk):
         if (work_w, work_h) != (width, height):
             label += f"\nSimulation at {work_w:,} × {work_h:,}"
         self.resolution.set(label)
+        timing = clip_timing(self.look, self.export.seconds)
+        rate = timing.motion_cycles / self.export.seconds
+        speed = abs(timing.rotation_turns) * 360 / self.export.seconds
+        self.motion_summary.set(f"Actual motion · {rate:.3g} cycles/s")
+        self.rotation_summary.set(f"Actual rotation · {speed:.2f}°/s")
 
     def preview_quality(self, _event=None):
         self.preview_edge = 440 if self.look.mode == POOL else 560
@@ -603,7 +623,7 @@ class EntropyApp(tk.Tk):
                 missed = math.floor(max(0, now - self.last_due) * 30)
                 self.skipped += missed
                 self.last_due += (missed + 1) / 30
-            self.worker.request(self.current_ticket, size, phase, self.look)
+            self.worker.request(self.current_ticket, size, phase, self.look, self.export.seconds)
             self.pending = (self.current_ticket, self.revision, now, self.look)
             self.dirty = False
         elif visible and self.pending is not None and now - self.pending[2] > .16:
