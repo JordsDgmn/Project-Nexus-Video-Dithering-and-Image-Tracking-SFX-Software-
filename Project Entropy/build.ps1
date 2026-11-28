@@ -1,7 +1,7 @@
 param(
     [string]$Python = 'python',
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 -]*$')]
-    [string]$Name = 'Project Entropy Studio v4'
+    [string]$Name = 'Project Entropy Studio v7'
 )
 
 $ErrorActionPreference = 'Stop'

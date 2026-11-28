@@ -8,6 +8,8 @@ import re
 import cv2
 import numpy as np
 
+from entropy_bokeh import LIGHT_COLORS, BokehCamera, BokehSettings, light_points
+from entropy_style import Style, StyleStack, pulse_exposure
 from entropy_texture import Texture, TextureStack
 
 
@@ -64,6 +66,8 @@ class Look:
     rotation_angle: int = 0
     rotation_speed: int = 0
     rotation_direction: str = "Clockwise"
+    style: Style = field(default_factory=Style)
+    bokeh: BokehSettings = field(default_factory=BokehSettings)
 
     def validate(self):
         if self.mode not in MODES or self.palette not in (*PALETTES, CUSTOM) or self.blend not in BLENDS:
@@ -86,6 +90,12 @@ class Look:
         if not isinstance(self.textures, Texture):
             raise ValueError("Invalid texture settings.")
         self.textures.validate()
+        if not isinstance(self.style, Style):
+            raise ValueError("Invalid style settings.")
+        self.style.validate()
+        if not isinstance(self.bokeh, BokehSettings):
+            raise ValueError("Invalid bokeh camera settings.")
+        self.bokeh.validate()
         return self
 
 
@@ -127,6 +137,16 @@ def decode_look(data):
         if not isinstance(values["textures"], dict):
             raise ValueError("Invalid texture settings.")
         values["textures"] = Texture(**values["textures"])
+    if "style" in values:
+        if not isinstance(values["style"], dict):
+            raise ValueError("Invalid style settings.")
+        values["style"] = Style(**values["style"])
+    if "bokeh" in values:
+        if not isinstance(values["bokeh"], dict):
+            raise ValueError("Invalid bokeh camera settings.")
+        values["bokeh"] = BokehSettings(**values["bokeh"])
+    elif values.get("mode") == BOKEH:
+        values["bokeh"] = BokehSettings(model="Classic")
     return Look(**values).validate()
 
 
@@ -245,10 +265,12 @@ class Simulator:
         self.edge = np.exp(-.48 * ((2 * self.x / self.aspect_x) ** 2 + (2 * self.y / self.aspect_y) ** 2))
         self.noise = np.random.default_rng(815).uniform(-.0018, .0018, (self.height, self.width)).astype(np.float32)
         self.textures = None
+        self.style = None
+        self.camera = None
 
-    def color(self, field, look):
+    def color(self, field, look, palette=None):
         phase = np.remainder(.49 + (field - .49) * (look.spectrum / 100) + look.hue / 360, 1)
-        palette = look.colors if look.palette == CUSTOM else PALETTES[look.palette]
+        palette = palette or (look.colors if look.palette == CUSTOM else PALETTES[look.palette])
         return spectral_lut(tuple(palette), look.saturation)[np.minimum(2047, (phase * 2048).astype(np.int32))]
 
     def frame(self, turn, look, seconds=BASE_MOTION_SECONDS):
@@ -260,7 +282,16 @@ class Simulator:
         scatter = look.scatter / 100
         density = 2 ** ((look.compact - 48) / 34)
         if look.mode == BOKEH:
-            emission, ground = self.bokeh(t, look, scatter, density)
+            if look.bokeh.model == "Classic":
+                emission, ground = self.classic_bokeh(t, look, scatter, density)
+            else:
+                if self.camera is None:
+                    self.camera = BokehCamera((self.width, self.height))
+                points = light_points(look.seed, look.bokeh.layout)
+                color_phase = .49 + (points[:, 4] - .5) * (.55 + .60*look.dispersion/100)
+                colors = self.color(color_phase, look, LIGHT_COLORS[look.bokeh.light_color])
+                emission, ground = self.camera.render(look.bokeh, look, t, progress, seconds,
+                                                       look.loop_fit == SEAMLESS, colors)
             light = np.clip(emission * 2.1, 0, 1) if look.blend == "Multiply" else None
         else:
             if look.mode == AURA:
@@ -316,16 +347,26 @@ class Simulator:
         result += self.noise[:, :, None]
         np.clip(result, 0, 1, out=result)
         frame = cv2.convertScaleAbs(result, alpha=255)
+        style = look.style
+        if style.has_layers:
+            if self.style is None:
+                self.style = StyleStack((self.width, self.height))
+            if style.has_form:
+                frame = self.style.form(frame, style, t)
         rotation = math.remainder(look.rotation_angle + progress * timing.rotation_turns * 360, 360)
         if abs(rotation) > 1e-8:
             center = ((self.width - 1) / 2, (self.height - 1) / 2)
             transform = cv2.getRotationMatrix2D(center, -rotation, 1)
             frame = cv2.warpAffine(frame, transform, (self.width, self.height),
                                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        if style.has_layers and (style.flare or style.has_particles):
+            frame = self.style.lights(frame, style, t)
         if look.textures.active:
             if self.textures is None:
                 self.textures = TextureStack((self.width, self.height))
             frame = self.textures.apply(frame, look.textures, position, look.seed, rgb(look.background)*255)
+        if style.enabled and style.strobe:
+            frame = pulse_exposure(frame, style, progress * seconds)
         return frame
 
     def glow(self, emission, amount):
@@ -455,7 +496,7 @@ class Simulator:
         ground = .25 + .34 * self.edge + .18 * np.sin(7*a + 3*b + t + p[2])**2
         return np.minimum(energy, 1.03), .49 + hue, np.minimum(white, .34), ground
 
-    def bokeh(self, t, look, scatter, density):
+    def classic_bokeh(self, t, look, scatter, density):
         specs = bokeh_lights(look.seed)
         count = min(len(specs), max(10, round(12 + density * 15 + scatter * 12)))
         specs = specs[:count]

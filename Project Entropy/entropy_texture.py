@@ -32,6 +32,12 @@ class Texture:
     levels: int = 8
     vignette: int = 0
     enabled: bool = True
+    paper: int = 0
+    fiber_size: int = 35
+    scratches: int = 0
+    scratch_count: int = 13
+    scanlines: int = 0
+    line_spacing: int = 7
 
     def validate(self):
         for key, low, high in (
@@ -40,7 +46,9 @@ class Texture:
             ("tatter", 0, 100), ("edge_width", 2, 30), ("roughness", 0, 100),
             ("halftone", 0, 100), ("cell_size", 3, 36), ("angle", 0, 180),
             ("chromatic", 0, 100), ("posterize", 0, 100), ("levels", 2, 32),
-            ("vignette", 0, 100),
+            ("vignette", 0, 100), ("paper", 0, 100), ("fiber_size", 1, 100),
+            ("scratches", 0, 100), ("scratch_count", 1, 40),
+            ("scanlines", 0, 100), ("line_spacing", 2, 24),
         ):
             value = getattr(self, key)
             if type(value) is not int or not low <= value <= high:
@@ -52,7 +60,8 @@ class Texture:
     @property
     def active(self):
         return self.enabled and any((self.grain, self.distort, self.ripple, self.tatter, self.halftone,
-                    self.chromatic, self.posterize, self.vignette))
+                    self.chromatic, self.posterize, self.vignette,
+                    self.paper, self.scratches, self.scanlines))
 
 
 @lru_cache(maxsize=18)
@@ -66,6 +75,11 @@ def noise_tile(seed, index, colored):
 def posterize_lut(levels):
     return np.rint(np.rint(np.arange(256) * ((levels - 1) / 255))
                    * (255 / (levels - 1))).astype(np.uint8)
+
+
+@lru_cache(maxsize=12)
+def scratch_points(seed):
+    return np.random.default_rng(seed ^ 81523).random((40, 6))
 
 
 class TextureStack:
@@ -82,6 +96,8 @@ class TextureStack:
         self.edge_key = None
         self.edge_traces = None
         self.vignette_mask = None
+        self.paper_key = None
+        self.paper_field = None
 
     def apply(self, frame, config, phase, seed, background):
         t = math.tau * phase
@@ -105,10 +121,48 @@ class TextureStack:
                 radius = (self.u * self.short / self.width * 2) ** 2 + (self.v * self.short / self.height * 2) ** 2
                 self.vignette_mask = np.clip((radius - .07) / 1.24, 0, 1)
             frame = np.uint8(np.rint(frame * (1 - .87 * config.vignette / 100 * self.vignette_mask[:, :, None])))
+        if config.paper or config.scratches or config.scanlines:
+            frame = self.surface(frame, config, t, seed)
         if config.grain:
             frame = self.add_grain(frame, config, phase, seed)
         if config.tatter:
             frame = self.torn_edges(frame, config, background, seed)
+        return frame
+
+    def surface(self, frame, config, t, seed):
+        if config.paper:
+            key = config.fiber_size, seed
+            if key != self.paper_key:
+                # Two scales make fiber and mottling independently visible in the same paper.
+                scale = .024 + config.fiber_size * .0018
+                fine_w, fine_h = (max(4, round(side * scale)) for side in (self.width, self.height))
+                rng = np.random.default_rng(seed ^ 35903)
+                fiber = rng.normal(0, 1, (fine_h, fine_w)).astype(np.float32)
+                fiber = cv2.GaussianBlur(fiber, (0, 0), .56, sigmaY=1.5)
+                mottle = rng.normal(0, 1, (max(3, fine_h//5), max(3, fine_w//5))).astype(np.float32)
+                size = (self.width, self.height)
+                self.paper_field = (cv2.resize(fiber, size, interpolation=cv2.INTER_LINEAR) * .82
+                                    + cv2.resize(mottle, size, interpolation=cv2.INTER_CUBIC) * .14)
+                self.paper_key = key
+            # Keep the color of the underlying highlights while picking up darker fibers.
+            frame = np.uint8(np.clip(frame + self.paper_field[:, :, None] * (.72 * config.paper), 0, 255))
+        if config.scanlines:
+            pitch = max(2.0, config.line_spacing * self.short / 540)
+            alpha = .68 * config.scanlines / 100
+            mask = (1 - alpha * (.5 + .5*np.cos(self.y * (math.tau / pitch)))**3).astype(np.float32)
+            frame = np.uint8(np.rint(frame * mask[:, :, None]))
+        if config.scratches:
+            mask = np.zeros((self.height, self.width), dtype=np.uint8)
+            for x, y, length, tilt, opacity, phase in scratch_points(seed)[:config.scratch_count]:
+                wobble = t + phase * math.tau
+                cx = round(x * self.width + .012 * self.short * math.sin(wobble))
+                cy = round(y * self.height)
+                end = (cx + round((tilt - .5) * self.short * .032),
+                       cy + round(self.short * (.045 + .43 * length)))
+                shine = (.32 + .68 * math.cos(wobble)**4) * (.35 + opacity * .65)
+                color = round(1.33 * config.scratches * shine)
+                cv2.line(mask, (cx, cy), end, color, max(1, round(self.short/650)), cv2.LINE_AA)
+            frame = cv2.add(frame, cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB))
         return frame
 
     def warp(self, frame, config, t, seed):
